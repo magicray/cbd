@@ -60,7 +60,7 @@ def logging_thread(logdir):
     os.makedirs(logdir, exist_ok=True)
 
     next_file = 0
-    log_files = [int(p) for p in os.listdir(logdir) if isdigit(p)]
+    log_files = [int(p) for p in os.listdir(logdir) if p.isdigit()]
     if log_files:
         next_file = max(log_files) + 1
 
