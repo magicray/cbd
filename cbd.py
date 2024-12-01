@@ -13,6 +13,9 @@ import threading
 from logging import critical as log
 
 
+MUTEX = threading.Lock()
+
+
 class NBD:
     SET_SOCK = 43776
     SET_BLKSIZE = 43777
@@ -53,21 +56,36 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-async def replicator():
+def logging_thread(logdir):
+    os.makedirs(logdir, exist_ok=True)
+
+    next_file = 0
+    log_files = [int(p) for p in os.listdir(logdir) if isdigit(p)]
+    if log_files:
+        next_file = max(log_files) + 1
+
     while True:
-        blobs, ARGS.blobs = ARGS.blobs, list()
+        with MUTEX:
+            blobs, ARGS.blobs = ARGS.blobs, list()
 
-        size = 0
-        for b in blobs:
-            size += len(b)
-        log('size {}'.format(size))
+        if blobs:
+            size = 0
+            tmp_file = os.path.join(logdir, 'tmp.' + uuid.uuid4().hex)
+            with open(tmp_file, 'wb') as fd:
+                for b in blobs:
+                    fd.write(b)
+                    size += len(b)
+            os.rename(tmp_file, os.path.join(logdir, str(next_file)))
+            log('logfile({}) size({})'.format(next_file, size))
 
-        await asyncio.sleep(1)
+            next_file += 1
+
+        time.sleep(1)
 
 
 async def server(reader, writer):
     peer = writer.get_extra_info('socket').getpeername()
-    log('connection from %s', peer)
+    log('connection received')
 
     request_magic = 0x25609513
     response_magic = 0x67446698
@@ -98,8 +116,9 @@ async def server(reader, writer):
         if 'write'  == cmd:
             octets = await reader.readexactly(length)
 
-            ARGS.blobs.append(struct.pack('!QQ', offset, length))
-            ARGS.blobs.append(octets)
+            with MUTEX:
+                ARGS.blobs.append(struct.pack('!QQ', offset, length))
+                ARGS.blobs.append(octets)
 
             os.lseek(ARGS.fd, offset, os.SEEK_SET)
             os.write(ARGS.fd, octets)
@@ -113,10 +132,7 @@ def server_thread(socket_path):
         async with srv:
             await srv.serve_forever()
 
-    loop = asyncio.new_event_loop()
-    loop.create_task(start_server())
-    loop.create_task(replicator())
-    loop.run_forever()
+    asyncio.run(start_server())
 
 
 if __name__ == '__main__':
@@ -134,6 +150,8 @@ if __name__ == '__main__':
         help='Device Block Count')
     ARGS.add_argument('--timeout', type=int, default=60,
         help='Timeout in seconds')
+    ARGS.add_argument('--logdir', default='logs',
+        help='Local directory for write logs')
 
     ARGS = ARGS.parse_args()
     ARGS.blobs = list()
@@ -143,6 +161,7 @@ if __name__ == '__main__':
 
     ARGS.socket_path = os.path.join('/tmp', 'cbd-sock.' + uuid.uuid4().hex)
     threading.Thread(target=server_thread, args=(ARGS.socket_path,)).start()
+    threading.Thread(target=logging_thread, args=(ARGS.logdir,)).start()
 
     device_init(ARGS.device, ARGS.block_size, ARGS.block_count, ARGS.timeout,
                 ARGS.socket_path)
