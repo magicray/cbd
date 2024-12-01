@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import mmap
+import uuid
 import fcntl
 import struct
 import socket
@@ -25,88 +27,96 @@ class NBD:
     SET_FLAGS = 43786
 
 
-def device_init(dev, block_size, block_count, timeout, ip, port):
+def device_init(dev, block_size, block_count, timeout, socket_path):
     fd = os.open(dev, os.O_RDWR)
     fcntl.ioctl(fd, NBD.CLEAR_QUEUE)
     fcntl.ioctl(fd, NBD.DISCONNECT)
     fcntl.ioctl(fd, NBD.CLEAR_SOCK)
-    log('opened(%s)', dev)
-
     fcntl.ioctl(fd, NBD.SET_BLKSIZE, block_size)
     fcntl.ioctl(fd, NBD.SET_SIZE_BLOCKS, block_count)
     fcntl.ioctl(fd, NBD.SET_TIMEOUT, timeout)
     log('initialized(%s) block_size(%d) block_count(%d)',
         dev, block_size, block_count)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((ip, port))
-    log('connected(%s) ip(%s) port(%d)', dev, ip, port)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    while True:
+        try:
+            sock.connect(socket_path)
+            log('connected(%s) socket(%s)', dev, socket_path)
+            break
+        except Exception as e:
+            log(e)
+            time.sleep(1)
 
     fcntl.ioctl(fd, NBD.SET_SOCK, sock.fileno())
     fcntl.ioctl(fd, NBD.DO_IT)
+
+
+async def replicator():
+    while True:
+        blobs, ARGS.blobs = ARGS.blobs, list()
+
+        size = 0
+        for b in blobs:
+            size += len(b)
+        log('size {}'.format(size))
+
+        await asyncio.sleep(1)
 
 
 async def server(reader, writer):
     peer = writer.get_extra_info('socket').getpeername()
     log('connection from %s', peer)
 
-    blocks = dict()
     request_magic = 0x25609513
     response_magic = 0x67446698
 
     while True:
-        try:
-            magic, flags, cmd, cookie, offset, length = struct.unpack(
-                '!IHHQQI', await reader.readexactly(28))
+        magic, flags, cmd, cookie, offset, length = struct.unpack(
+            '!IHHQQI', await reader.readexactly(28))
 
-            if magic != request_magic:
-                raise Exception('Invalid Magic Number : 0x{:8x}'.format(magic))
+        if magic != request_magic:
+            raise Exception('Invalid Magic Number : 0x{:8x}'.format(magic))
 
-            if cmd not in (0, 1):
-                raise Exception('Invalid CMD : {}'.format(cmd))
+        if cmd not in (0, 1):
+            raise Exception('Invalid CMD : {}'.format(cmd))
 
-            if offset % ARGS.block_size:
-                raise Exception('Invalid Offset : {:d}'.format(offset))
+        cmd = 'read' if 0 == cmd else 'write'
 
-            if length % ARGS.block_size:
-                raise Exception('Invalid Length : {:d}'.format(length))
+        log('%5s offset(%d) length(%d)', cmd, offset, length)
 
-            cmd = 'read' if 0 == cmd else 'write'
-            block_index = offset // ARGS.block_size
-            block_count = length // ARGS.block_size
+        # Read request
+        if 'read' == cmd:
+            writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
 
-            log('%s block_index(%d) block_count(%d)', cmd, block_index, block_count)
+            os.lseek(ARGS.fd, offset, os.SEEK_SET)
 
-            # Read request
-            if 'read' == cmd:
-                writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
-                
-                for i in range(block_count):
-                    writer.write(blocks.get(block_index + i, b'A' * ARGS.block_size))
+            writer.write(os.read(ARGS.fd, length))
 
-            # Write request
-            if 'write'  == cmd:
-                for i in range(block_count):
-                    blocks[block_index + i] = await reader.readexactly(ARGS.block_size)
+        # Write request
+        if 'write'  == cmd:
+            octets = await reader.readexactly(length)
 
-                writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
-        except Exception as e:
-            writer.close()
-            log('closed{} {}'.format(peer, e))
-            log('magic(0x%08x) flags(0x%04x) cmd(0x%04x) cookie(0x%016x) offset(%d) length(%d)',
-                magic, flags, cmd, cookie, offset, length)
-            return
+            ARGS.blobs.append(struct.pack('!QQ', offset, length))
+            ARGS.blobs.append(octets)
+
+            os.lseek(ARGS.fd, offset, os.SEEK_SET)
+            os.write(ARGS.fd, octets)
+
+            writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
 
 
-def server_thread(ip, port):
+def server_thread(socket_path):
     async def start_server():
-        srv = await asyncio.start_server(server, ip, port)
+        srv = await asyncio.start_unix_server(server, socket_path)
         async with srv:
             await srv.serve_forever()
 
-    asyncio.run(start_server())
-    log('server exited')
-    sys.exit(1)
+    loop = asyncio.new_event_loop()
+    loop.create_task(start_server())
+    loop.create_task(replicator())
+    loop.run_forever()
 
 
 if __name__ == '__main__':
@@ -114,22 +124,25 @@ if __name__ == '__main__':
 
     ARGS = argparse.ArgumentParser()
 
-    ARGS.add_argument('--device', default='/dev/nbd0',
+    ARGS.add_argument('--device',
         help='Network Block Device path')
+    ARGS.add_argument('--cache_file', default='cache_file',
+        help='Local file for caching')
     ARGS.add_argument('--block_size', type=int, default=4096,
         help='Device Block Size')
     ARGS.add_argument('--block_count', type=int, default=256*1024,
         help='Device Block Count')
     ARGS.add_argument('--timeout', type=int, default=60,
         help='Timeout in seconds')
-    ARGS.add_argument('--ip', default='localhost',
-        help='Server IP Address')
-    ARGS.add_argument('--port', type=int, default=5000,
-        help='Server Port')
 
     ARGS = ARGS.parse_args()
+    ARGS.blobs = list()
 
-    threading.Thread(target=server_thread, args=(ARGS.ip, ARGS.port)).start()
-    time.sleep(2)
+    ARGS.fd = os.open(ARGS.cache_file, os.O_CREAT | os.O_RDWR)
+    fcntl.flock(ARGS.fd, fcntl.LOCK_EX)
+
+    ARGS.socket_path = os.path.join('/tmp', 'cbd-sock.' + uuid.uuid4().hex)
+    threading.Thread(target=server_thread, args=(ARGS.socket_path,)).start()
+
     device_init(ARGS.device, ARGS.block_size, ARGS.block_count, ARGS.timeout,
-                ARGS.ip, ARGS.port)
+                ARGS.socket_path)
