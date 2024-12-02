@@ -7,13 +7,14 @@ import fcntl
 import struct
 import socket
 import asyncio
-import logging
-import argparse
 import threading
 from logging import critical as log
 
 
-MUTEX = threading.Lock()
+class G:
+    blobs = list()
+    mutex = threading.Lock()
+    snapshot = None
 
 
 class NBD:
@@ -56,31 +57,18 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-def logging_thread(logdir):
-    os.makedirs(logdir, exist_ok=True)
-
-    next_file = 0
-    log_files = [int(p) for p in os.listdir(logdir) if p.isdigit()]
-    if log_files:
-        next_file = max(log_files) + 1
-
+def logger_thread():
     while True:
-        with MUTEX:
-            blobs, ARGS.blobs = ARGS.blobs, list()
+        blobs = None
+
+        with G.mutex:
+            if G.blobs:
+                blobs, G.blobs = G.blobs, list()
 
         if blobs:
-            size = 0
-            tmp_file = os.path.join(logdir, 'tmp.' + uuid.uuid4().hex)
-            with open(tmp_file, 'wb') as fd:
-                for b in blobs:
-                    fd.write(b)
-                    size += len(b)
-            os.rename(tmp_file, os.path.join(logdir, str(next_file)))
-            log('logfile({}) size({})'.format(next_file, size))
-
-            next_file += 1
-
-        time.sleep(1)
+            log('size({})'.format(sum([len(b) for b in blobs])))
+        else:
+            time.sleep(1)
 
 
 async def server(reader, writer):
@@ -102,66 +90,36 @@ async def server(reader, writer):
 
         cmd = 'read' if 0 == cmd else 'write'
 
-        log('%5s offset(%d) length(%d)', cmd, offset, length)
+        log('%5s(%d) length(%d)', cmd, offset, length)
 
         # Read request
         if 'read' == cmd:
             writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
 
-            os.lseek(ARGS.fd, offset, os.SEEK_SET)
+            os.lseek(G.snapshot, offset, os.SEEK_SET)
 
-            writer.write(os.read(ARGS.fd, length))
+            writer.write(os.read(G.snapshot, length))
 
         # Write request
         if 'write'  == cmd:
             octets = await reader.readexactly(length)
 
-            with MUTEX:
-                ARGS.blobs.append(struct.pack('!QQ', offset, length))
-                ARGS.blobs.append(octets)
-
-            os.lseek(ARGS.fd, offset, os.SEEK_SET)
-            os.write(ARGS.fd, octets)
+            with G.mutex:
+                G.blobs.append(struct.pack('!QQ', offset, length))
+                G.blobs.append(octets)
+        
+            os.lseek(G.snapshot, offset, os.SEEK_SET)
+            os.write(G.snapshot, octets)
 
             writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
 
 
-def server_thread(socket_path):
+def server_thread(socket_path, snapshot):
+    G.snapshot = os.open(snapshot, os.O_RDWR)
+
     async def start_server():
         srv = await asyncio.start_unix_server(server, socket_path)
         async with srv:
             await srv.serve_forever()
 
     asyncio.run(start_server())
-
-
-if __name__ == '__main__':
-    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-
-    ARGS = argparse.ArgumentParser()
-
-    ARGS.add_argument('--device',
-        help='Network Block Device path')
-    ARGS.add_argument('--cache_file', default='cache_file',
-        help='Local file for caching')
-    ARGS.add_argument('--block_size', type=int, default=4096,
-        help='Device Block Size')
-    ARGS.add_argument('--block_count', type=int, default=256*1024,
-        help='Device Block Count')
-    ARGS.add_argument('--timeout', type=int, default=60,
-        help='Timeout in seconds')
-    ARGS.add_argument('--logdir', default='logs',
-        help='Local directory for write logs')
-
-    ARGS = ARGS.parse_args()
-    ARGS.blobs = list()
-
-    ARGS.fd = os.open(ARGS.cache_file, os.O_CREAT | os.O_RDWR)
-    fcntl.flock(ARGS.fd, fcntl.LOCK_EX)
-
-    ARGS.socket_path = os.path.join('/tmp', 'cbd-sock.' + uuid.uuid4().hex)
-    threading.Thread(target=server_thread, args=(ARGS.socket_path,)).start()
-    threading.Thread(target=logging_thread, args=(ARGS.logdir,)).start()
-
-    device_init(ARGS.device, ARGS.block_size, ARGS.block_count, ARGS.timeout,
-                ARGS.socket_path)
