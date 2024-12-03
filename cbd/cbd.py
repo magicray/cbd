@@ -1,20 +1,19 @@
 import os
-import sys
 import time
-import mmap
-import uuid
 import fcntl
 import struct
 import socket
-import asyncio
+import hashlib
 import threading
 from logging import critical as log
 
 
 class G:
+    conn = None
     blobs = list()
     mutex = threading.Lock()
     snapshot = None
+    responses = list()
 
 
 class NBD:
@@ -57,30 +56,64 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-def logger_thread():
+def backup():
     while True:
         blobs = None
 
         with G.mutex:
             if G.blobs:
                 blobs, G.blobs = G.blobs, list()
+                responses, G.responses = G.responses, list()
 
         if blobs:
-            log('size({})'.format(sum([len(b) for b in blobs])))
+            log('size({})'.format(sum([len(b[1]) for b in blobs])))
+
+            with G.mutex:
+                for offset, octets in blobs:
+                    os.lseek(G.snapshot, offset, os.SEEK_SET)
+                    os.write(G.snapshot, octets)
+
+            for response in responses:
+                # G.blobs.append(struct.pack('!QQ', offset, length))
+                G.conn.sendall(response)
         else:
-            time.sleep(1)
+            time.sleep(0.1)
 
 
-async def server(reader, writer):
-    peer = writer.get_extra_info('socket').getpeername()
-    log('connection received')
+def recvall(socket, length):
+    buf = list()
+    while length:
+        octets = socket.recv(length)
+
+        if not octets:
+            socket.close()
+            raise Exception('Connection closed')
+
+        buf.append(octets)
+        length -= len(octets)
+
+    return b''.join(buf)
+
+
+def server(socket_path):
+    if os.path.exists(socket_path):
+        os.remove(socket_path)
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(socket_path)
+    sock.listen(1)
+
+    conn, peer = sock.accept()
+    G.conn = conn
+
+    log('Connection received from {}'.format(peer))
 
     request_magic = 0x25609513
     response_magic = 0x67446698
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
-            '!IHHQQI', await reader.readexactly(28))
+            '!IHHQQI', recvall(conn, 28))
 
         if magic != request_magic:
             raise Exception('Invalid Magic Number : 0x{:8x}'.format(magic))
@@ -94,32 +127,32 @@ async def server(reader, writer):
 
         # Read request
         if 'read' == cmd:
-            writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
-
-            os.lseek(G.snapshot, offset, os.SEEK_SET)
-
-            writer.write(os.read(G.snapshot, length))
-
-        # Write request
-        if 'write'  == cmd:
-            octets = await reader.readexactly(length)
+            conn.sendall(struct.pack('!IIQ', response_magic, 0, cookie))
 
             with G.mutex:
-                G.blobs.append(struct.pack('!QQ', offset, length))
-                G.blobs.append(octets)
-        
-            os.lseek(G.snapshot, offset, os.SEEK_SET)
-            os.write(G.snapshot, octets)
+                os.lseek(G.snapshot, offset, os.SEEK_SET)
+                octets = os.read(G.snapshot, length)
 
-            writer.write(struct.pack('!IIQ', response_magic, 0, cookie))
+            conn.sendall(octets)
+
+        # Write request
+        if 'write' == cmd:
+            octets = recvall(conn, length)
+
+            with G.mutex:
+                G.blobs.append((offset, octets))
+                G.responses.append(struct.pack('!IIQ', response_magic, 0,
+                                               cookie))
 
 
-def server_thread(socket_path, snapshot):
-    G.snapshot = os.open(snapshot, os.O_RDWR)
+def main(device_path, block_size, block_count, timeout, snapshot_path):
+    G.snapshot = os.open(snapshot_path, os.O_RDWR)
+    fcntl.flock(G.snapshot, fcntl.LOCK_EX)
 
-    async def start_server():
-        srv = await asyncio.start_unix_server(server, socket_path)
-        async with srv:
-            await srv.serve_forever()
+    socket_path = hashlib.md5(device_path.encode() + snapshot_path.encode())
+    socket_path = os.path.join('/tmp', 'cbd.' + socket_path.hexdigest())
 
-    asyncio.run(start_server())
+    threading.Thread(target=server, args=(socket_path,)).start()
+    threading.Thread(target=backup).start()
+
+    device_init(device_path, block_size, block_count, timeout, socket_path)

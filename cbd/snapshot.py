@@ -22,8 +22,8 @@ def main(filepath, logdir):
                     wfile.seek(offset)
                     wfile.write(octets)
 
-                    log('file({}) offset({}) length({})'.format(filenum, offset, length))
-
+                    log('file({}) offset({}) length({})'.format(
+                        filenum, offset, length))
 
 
 if __name__ == '__main__':
