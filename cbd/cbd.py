@@ -11,8 +11,9 @@ from logging import critical as log
 class G:
     conn = None
     batch = list()
-    mutex = threading.Lock()
     snapshot = None
+    batch_lock = threading.Lock()
+    snapshot_lock = threading.Lock()
 
 
 class NBD:
@@ -59,7 +60,7 @@ def backup():
     while True:
         batch = None
 
-        with G.mutex:
+        with G.batch_lock:
             if G.batch:
                 # Take out the current batch
                 # Writer would start using the next batch
@@ -71,7 +72,7 @@ def backup():
             # struct.pack('!QQ', offset, len(octets))
             log('size({})'.format(sum([len(b[1]) for b in batch])))
 
-            with G.mutex:
+            with G.snapshot_lock:
                 # Take the lock before updating the snapshot to ensure
                 # that read request does not send garbled data
                 for offset, octets, response in batch:
@@ -135,7 +136,7 @@ def server(socket_path):
         if 0 == cmd:
             conn.sendall(response_header)
 
-            with G.mutex:
+            with G.snapshot_lock:
                 os.lseek(G.snapshot, offset, os.SEEK_SET)
                 octets = os.read(G.snapshot, length)
 
@@ -148,7 +149,7 @@ def server(socket_path):
         if 1 == cmd:
             octets = recvall(conn, length)
 
-            with G.mutex:
+            with G.batch_lock:
                 G.batch.append((offset, octets, response_header))
 
 
