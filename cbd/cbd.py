@@ -10,10 +10,9 @@ from logging import critical as log
 
 class G:
     conn = None
-    blobs = list()
+    batch = list()
     mutex = threading.Lock()
     snapshot = None
-    responses = list()
 
 
 class NBD:
@@ -58,23 +57,29 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
 
 def backup():
     while True:
-        blobs = None
+        batch = None
 
         with G.mutex:
-            if G.blobs:
-                blobs, G.blobs = G.blobs, list()
-                responses, G.responses = G.responses, list()
+            if G.batch:
+                # Take out the current batch
+                # Writer would start using the next batch
+                batch, G.batch = G.batch, list()
 
-        if blobs:
-            log('size({})'.format(sum([len(b[1]) for b in blobs])))
+        if batch:
+            # Upload it to Object Store
+            # for offset, octets, _ in batch:
+            # struct.pack('!QQ', offset, len(octets))
+            log('size({})'.format(sum([len(b[1]) for b in batch])))
 
             with G.mutex:
-                for offset, octets in blobs:
+                # Take the lock before updating the snapshot to ensure
+                # that read request does not send garbled data
+                for offset, octets, response in batch:
                     os.lseek(G.snapshot, offset, os.SEEK_SET)
                     os.write(G.snapshot, octets)
 
-            for response in responses:
-                # G.blobs.append(struct.pack('!QQ', offset, length))
+            # Everything done. We can acknowledge the write request now
+            for offset, octets, response in batch:
                 G.conn.sendall(response)
         else:
             time.sleep(0.1)
@@ -108,26 +113,27 @@ def server(socket_path):
 
     log('Connection received from {}'.format(peer))
 
-    request_magic = 0x25609513
-    response_magic = 0x67446698
-
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
             '!IHHQQI', recvall(conn, 28))
 
-        if magic != request_magic:
+        # Validate that it is a valid NBD request
+        if 0x25609513 != magic:
             raise Exception('Invalid Magic Number : 0x{:8x}'.format(magic))
 
+        # We support only 0:read and 1:write
         if cmd not in (0, 1):
             raise Exception('Invalid CMD : {}'.format(cmd))
 
-        cmd = 'read' if 0 == cmd else 'write'
+        log('cmd(%d) offset(%d) length(%d)', cmd, offset, length)
 
-        log('%5s(%d) length(%d)', cmd, offset, length)
+        # Response header is common. No errors are supported.
+        response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
-        # Read request
-        if 'read' == cmd:
-            conn.sendall(struct.pack('!IIQ', response_magic, 0, cookie))
+        # Handle the read request
+        # Send the data from the snapshot
+        if 0 == cmd:
+            conn.sendall(response_header)
 
             with G.mutex:
                 os.lseek(G.snapshot, offset, os.SEEK_SET)
@@ -135,14 +141,15 @@ def server(socket_path):
 
             conn.sendall(octets)
 
-        # Write request
-        if 'write' == cmd:
+        # Handle the write request
+        # Put the required data the next batch
+        # Backup thread would store the entire batch on the
+        # cloud and then only send the response back.
+        if 1 == cmd:
             octets = recvall(conn, length)
 
             with G.mutex:
-                G.blobs.append((offset, octets))
-                G.responses.append(struct.pack('!IIQ', response_magic, 0,
-                                               cookie))
+                G.batch.append((offset, octets, response_header))
 
 
 def main(device_path, block_size, block_count, timeout, snapshot_path):
