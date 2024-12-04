@@ -1,5 +1,6 @@
 import os
 import time
+import boto3
 import fcntl
 import struct
 import socket
@@ -9,9 +10,14 @@ from logging import critical as log
 
 
 class G:
+    s3 = None
     conn = None
     batch = list()
+    bucket = None
+    folder = None
     snapshot = None
+    log_index = None
+    device_size = None
     send_lock = threading.Lock()
     batch_lock = threading.Lock()
     snapshot_lock = threading.Lock()
@@ -28,10 +34,23 @@ def backup():
                 batch, G.batch = G.batch, list()
 
         if batch:
+            G.log_index += 1
+
+            # Build a combined blob from all the pending writes
+            body = list()
+            for offset, octets, response in batch:
+                body.append(struct.pack('!QQ', offset, len(octets)))
+                body.append(octets)
+            body = b''.join(body)
+
             # Upload it to Object Store
-            # for offset, octets, _ in batch:
-            # struct.pack('!QQ', offset, len(octets))
-            log('size({})'.format(sum([len(b[1]) for b in batch])))
+            G.s3.put_object(
+                Bucket=G.bucket,
+                Key=G.folder + '/logs/' + str(G.log_index),
+                Body=body,
+                ContentType='application/octet-stream')
+
+            log('uploaded({}) size({})'.format(G.log_index, len(body)))
 
             with G.snapshot_lock:
                 # Take the lock before updating the snapshot to ensure
@@ -39,6 +58,10 @@ def backup():
                 for offset, octets, response in batch:
                     os.lseek(G.snapshot, offset, os.SEEK_SET)
                     os.write(G.snapshot, octets)
+
+                os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
+                os.write(G.snapshot, struct.pack('!Q', G.log_index))
+                os.fsync(G.snapshot)
 
             with G.send_lock:
                 # Everything done
@@ -151,17 +174,57 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-def main(device_path, block_size, block_count, timeout, snapshot_path):
+def main(device_path, block_size, block_count, timeout, snapshot_path, s3path, max_log_index):
     G.snapshot = os.open(snapshot_path, os.O_RDWR)
     fcntl.flock(G.snapshot, fcntl.LOCK_EX)
 
-    device_size = block_size * block_count
-    assert (os.path.getsize(snapshot_path) == device_size)
+    G.device_size = block_size * block_count
+    assert (os.path.getsize(snapshot_path) == G.device_size + block_size)
+
+    os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
+    G.log_index = struct.unpack('!Q', os.read(G.snapshot, 8))[0]
+    log('snapshot({}) size({}) log_index({})'.format(
+        snapshot_path, G.device_size, G.log_index))
+
+    if s3path:
+        tmp = s3path.split('/')
+        endpoint, G.bucket, G.folder = '/'.join(tmp[:-2]), tmp[-2], tmp[-1]
+
+        G.s3 = boto3.client(
+            's3', endpoint_url=endpoint,
+            aws_access_key_id='1DPFNzs3yeEyrQepgERD',
+            aws_secret_access_key='GydnuHxjwtHHoNEEDyav7C2LRK2LbyHaeX9msnvg')
+
+        for log_index in range(G.log_index+1, max_log_index+1):
+            obj = G.s3.get_object(
+                Bucket=G.bucket,
+                Key=G.folder + '/logs/' + str(log_index))
+            body = obj['Body'].read()
+
+            assert (len(body) == obj['ContentLength'])
+
+            i = 0
+            while i < len(body):
+                offset, length = struct.unpack('!QQ', body[i:i+16])
+                octets = body[i+16:i+16+length]
+                i += 16 + length
+
+                os.lseek(G.snapshot, offset, os.SEEK_SET)
+                os.write(G.snapshot, octets)
+
+                log('log_index({}) offset({}) length({})'.format(
+                    log_index, offset, length))
+
+        os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
+        os.write(G.snapshot, struct.pack('!Q', max_log_index))
+        os.fsync(G.snapshot)
+
+        G.log_index = max_log_index + 1
 
     socket_path = hashlib.md5(device_path.encode() + snapshot_path.encode())
     socket_path = os.path.join('/tmp', 'cbd.' + socket_path.hexdigest())
 
-    threading.Thread(target=server, args=(socket_path, device_size)).start()
+    threading.Thread(target=server, args=(socket_path, G.device_size)).start()
     threading.Thread(target=backup).start()
 
     device_init(device_path, block_size, block_count, timeout, socket_path)
