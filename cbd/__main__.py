@@ -24,18 +24,14 @@ ARGS.add_argument(
     help='Timeout in seconds')
 
 ARGS.add_argument(
-    '--snapshot', default='snapshot',
-    help='File for keeping a snapshot')
+    '--volume', default='volume',
+    help='File for keeping a volume')
 
 ARGS.add_argument(
     '--s3path',
     help='s3path for this volume')
 
-ARGS.add_argument(
-    '--log_index', type=int,
-    help='Largest log index in s3 for this volume')
-
 ARGS = ARGS.parse_args()
 
 cbd.main(ARGS.device, ARGS.block_size, ARGS.block_count,
-         ARGS.timeout, ARGS.snapshot, ARGS.s3path, ARGS.log_index)
+         ARGS.timeout, ARGS.volume, ARGS.s3path)

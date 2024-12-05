@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import boto3
 import fcntl
@@ -11,16 +12,16 @@ from logging import critical as log
 
 class G:
     s3 = None
+    vol = None
     conn = None
     batch = list()
     bucket = None
-    folder = None
-    snapshot = None
+    volume = None
     log_index = None
     device_size = None
     send_lock = threading.Lock()
     batch_lock = threading.Lock()
-    snapshot_lock = threading.Lock()
+    volume_lock = threading.Lock()
 
 
 def backup():
@@ -46,22 +47,30 @@ def backup():
             # Upload it to Object Store
             G.s3.put_object(
                 Bucket=G.bucket,
-                Key=G.folder + '/logs/' + str(G.log_index),
+                Key=G.volume + '/logs/' + str(G.log_index),
                 Body=body,
                 ContentType='application/octet-stream')
 
+            # Update the volume details in the Object Store
+            G.s3.put_object(
+                Bucket=G.bucket,
+                Key=G.volume + '/details.json',
+                Body=json.dumps(dict(log_index=G.log_index)),
+                ContentType='application/json')
+
             log('uploaded({}) size({})'.format(G.log_index, len(body)))
 
-            with G.snapshot_lock:
+            with G.volume_lock:
                 # Take the lock before updating the snapshot to ensure
                 # that read request does not send garbled data
                 for offset, octets, response in batch:
-                    os.lseek(G.snapshot, offset, os.SEEK_SET)
-                    os.write(G.snapshot, octets)
+                    os.lseek(G.vol, offset, os.SEEK_SET)
+                    os.write(G.vol, octets)
 
-                os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
-                os.write(G.snapshot, struct.pack('!Q', G.log_index))
-                os.fsync(G.snapshot)
+                os.fsync(G.vol)
+                os.lseek(G.vol, G.device_size, os.SEEK_SET)
+                os.write(G.vol, struct.pack('!Q', G.log_index))
+                os.fsync(G.vol)
 
             with G.send_lock:
                 # Everything done
@@ -111,11 +120,11 @@ def server(socket_path, device_size):
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
-        # READ - send the data from the snapshot
+        # READ - send the data from the volume
         if 0 == cmd:
-            with G.snapshot_lock:
-                os.lseek(G.snapshot, offset, os.SEEK_SET)
-                octets = os.read(G.snapshot, length)
+            with G.volume_lock:
+                os.lseek(G.vol, offset, os.SEEK_SET)
+                octets = os.read(G.vol, length)
                 assert (len(octets) == length)
 
             with G.send_lock:
@@ -174,31 +183,35 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-def main(device_path, block_size, block_count, timeout, snapshot_path, s3path, max_log_index):
-    G.snapshot = os.open(snapshot_path, os.O_RDWR)
-    fcntl.flock(G.snapshot, fcntl.LOCK_EX)
+def main(device_path, block_size, block_count, timeout, volume_path, s3path):
+    G.vol = os.open(volume_path, os.O_RDWR)
+    fcntl.flock(G.vol, fcntl.LOCK_EX)
+    G.volume = os.path.basename(volume_path)
 
     G.device_size = block_size * block_count
-    assert (os.path.getsize(snapshot_path) == G.device_size + block_size)
+    assert (os.path.getsize(volume_path) >= G.device_size + block_size)
 
-    os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
-    G.log_index = struct.unpack('!Q', os.read(G.snapshot, 8))[0]
-    log('snapshot({}) size({}) log_index({})'.format(
-        snapshot_path, G.device_size, G.log_index))
+    os.lseek(G.vol, G.device_size, os.SEEK_SET)
+    G.log_index = struct.unpack('!Q', os.read(G.vol, 8))[0]
+    log('volume({}) size({}) log_index({})'.format(
+        volume_path, G.device_size, G.log_index))
 
     if s3path:
         tmp = s3path.split('/')
-        endpoint, G.bucket, G.folder = '/'.join(tmp[:-2]), tmp[-2], tmp[-1]
+        endpoint, G.bucket = '/'.join(tmp[:-1]), tmp[-1]
 
         G.s3 = boto3.client(
             's3', endpoint_url=endpoint,
             aws_access_key_id='1DPFNzs3yeEyrQepgERD',
             aws_secret_access_key='GydnuHxjwtHHoNEEDyav7C2LRK2LbyHaeX9msnvg')
 
+        obj = G.s3.get_object(Bucket=G.bucket, Key=G.volume + '/details.json')
+        max_log_index = json.loads(obj['Body'].read())['log_index']
+
         for log_index in range(G.log_index+1, max_log_index+1):
             obj = G.s3.get_object(
                 Bucket=G.bucket,
-                Key=G.folder + '/logs/' + str(log_index))
+                Key=G.volume + '/logs/' + str(log_index))
             body = obj['Body'].read()
 
             assert (len(body) == obj['ContentLength'])
@@ -209,19 +222,19 @@ def main(device_path, block_size, block_count, timeout, snapshot_path, s3path, m
                 octets = body[i+16:i+16+length]
                 i += 16 + length
 
-                os.lseek(G.snapshot, offset, os.SEEK_SET)
-                os.write(G.snapshot, octets)
+                os.lseek(G.vol, offset, os.SEEK_SET)
+                os.write(G.vol, octets)
 
                 log('log_index({}) offset({}) length({})'.format(
                     log_index, offset, length))
 
-        os.lseek(G.snapshot, G.device_size, os.SEEK_SET)
-        os.write(G.snapshot, struct.pack('!Q', max_log_index))
-        os.fsync(G.snapshot)
+        os.lseek(G.vol, G.device_size, os.SEEK_SET)
+        os.write(G.vol, struct.pack('!Q', max_log_index))
+        os.fsync(G.vol)
 
-        G.log_index = max_log_index + 1
+        G.log_index = max_log_index
 
-    socket_path = hashlib.md5(device_path.encode() + snapshot_path.encode())
+    socket_path = hashlib.md5(device_path.encode() + volume_path.encode())
     socket_path = os.path.join('/tmp', 'cbd.' + socket_path.hexdigest())
 
     threading.Thread(target=server, args=(socket_path, G.device_size)).start()
