@@ -6,6 +6,8 @@ import fcntl
 import struct
 import socket
 import hashlib
+import logging
+import argparse
 import threading
 from logging import critical as log
 
@@ -44,21 +46,22 @@ def backup():
                 body.append(octets)
             body = b''.join(body)
 
-            # Upload it to Object Store
-            G.s3.put_object(
-                Bucket=G.bucket,
-                Key=G.volume + '/logs/' + str(G.log_index),
-                Body=body,
-                ContentType='application/octet-stream')
+            if G.s3:
+                # Upload it to Object Store
+                G.s3.put_object(
+                    Bucket=G.bucket,
+                    Key=G.volume + '/logs/' + str(G.log_index),
+                    Body=body,
+                    ContentType='application/octet-stream')
 
-            # Update the volume details in the Object Store
-            G.s3.put_object(
-                Bucket=G.bucket,
-                Key=G.volume + '/details.json',
-                Body=json.dumps(dict(log_index=G.log_index)),
-                ContentType='application/json')
+                # Update the volume details in the Object Store
+                G.s3.put_object(
+                    Bucket=G.bucket,
+                    Key=G.volume + '/details.json',
+                    Body=json.dumps(dict(log_index=G.log_index)),
+                    ContentType='application/json')
 
-            log('uploaded({}) size({})'.format(G.log_index, len(body)))
+                log('uploaded({}) size({})'.format(G.log_index, len(body)))
 
             with G.volume_lock:
                 # Take the lock before updating the snapshot to ensure
@@ -184,19 +187,28 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
 
 
 def main(device_path, block_size, block_count, timeout, volume_path, s3path):
-    G.vol = os.open(volume_path, os.O_RDWR)
-    fcntl.flock(G.vol, fcntl.LOCK_EX)
-    G.volume = os.path.basename(volume_path)
+    if volume_path:
+        if not os.path.isfile(volume_path):
+            fd = os.open(volume_path, os.O_CREAT | os.O_RDWR)
+            os.write(fd, b'\x00' * block_size)
+            os.lseek(fd, block_size * block_count, os.SEEK_SET)
+            os.write(fd, struct.pack('!Q', 0))
+            os.fsync(fd)
+            os.close(fd)
 
-    G.device_size = block_size * block_count
-    assert (os.path.getsize(volume_path) >= G.device_size + block_size)
+        G.vol = os.open(volume_path, os.O_RDWR)
+        fcntl.flock(G.vol, fcntl.LOCK_EX)
+        G.volume = os.path.basename(volume_path)
 
-    os.lseek(G.vol, G.device_size, os.SEEK_SET)
-    G.log_index = struct.unpack('!Q', os.read(G.vol, 8))[0]
-    log('volume({}) size({}) log_index({})'.format(
-        volume_path, G.device_size, G.log_index))
+        G.device_size = block_size * block_count
+        assert (os.path.getsize(volume_path) >= G.device_size + 8)
 
-    if s3path:
+        os.lseek(G.vol, G.device_size, os.SEEK_SET)
+        G.log_index = struct.unpack('!Q', os.read(G.vol, 8))[0]
+        log('volume({}) size({}) log_index({})'.format(
+            volume_path, G.device_size, G.log_index))
+
+    if s3path and volume_path:
         tmp = s3path.split('/')
         endpoint, G.bucket = '/'.join(tmp[:-1]), tmp[-1]
 
@@ -228,16 +240,55 @@ def main(device_path, block_size, block_count, timeout, volume_path, s3path):
                 log('log_index({}) offset({}) length({})'.format(
                     log_index, offset, length))
 
+        os.fsync(G.vol)
         os.lseek(G.vol, G.device_size, os.SEEK_SET)
         os.write(G.vol, struct.pack('!Q', max_log_index))
         os.fsync(G.vol)
 
         G.log_index = max_log_index
 
-    socket_path = hashlib.md5(device_path.encode() + volume_path.encode())
-    socket_path = os.path.join('/tmp', 'cbd.' + socket_path.hexdigest())
+    if volume_path:
+        socket_path = hashlib.md5(device_path.encode() + volume_path.encode())
+        socket_path = os.path.join('/tmp', 'cbd.' + socket_path.hexdigest())
 
-    threading.Thread(target=server, args=(socket_path, G.device_size)).start()
-    threading.Thread(target=backup).start()
+        args = (socket_path, G.device_size)
+        threading.Thread(target=server, args=args).start()
+        threading.Thread(target=backup).start()
 
-    device_init(device_path, block_size, block_count, timeout, socket_path)
+    if device_path and block_size and block_count and socket_path:
+        device_init(device_path, block_size, block_count, timeout, socket_path)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
+
+    ARGS = argparse.ArgumentParser()
+
+    ARGS.add_argument(
+        '--device',
+        help='Network Block Device path')
+
+    ARGS.add_argument(
+        '--block_size', type=int, default=4096,
+        help='Device Block Size')
+
+    ARGS.add_argument(
+        '--block_count', type=int, default=256*1024,
+        help='Device Block Count')
+
+    ARGS.add_argument(
+        '--timeout', type=int, default=60,
+        help='Timeout in seconds')
+
+    ARGS.add_argument(
+        '--volume', default='volume',
+        help='File for keeping a volume')
+
+    ARGS.add_argument(
+        '--s3path',
+        help='s3path for this volume')
+
+    ARGS = ARGS.parse_args()
+
+    main(ARGS.device, ARGS.block_size, ARGS.block_count,
+         ARGS.timeout, ARGS.volume, ARGS.s3path)
