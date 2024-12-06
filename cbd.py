@@ -24,6 +24,7 @@ class G:
     send_lock = threading.Lock()
     batch_lock = threading.Lock()
     volume_lock = threading.Lock()
+    batch_event = threading.Event()
 
 
 def backup():
@@ -35,6 +36,7 @@ def backup():
                 # Take out the current batch
                 # Writer would start using the next batch
                 batch, G.batch = G.batch, list()
+                G.batch_event.clear()
 
         if batch:
             G.log_index += 1
@@ -71,9 +73,11 @@ def backup():
                     os.write(G.vol, octets)
 
                 os.fsync(G.vol)
-                os.lseek(G.vol, G.device_size, os.SEEK_SET)
-                os.write(G.vol, struct.pack('!Q', G.log_index))
-                os.fsync(G.vol)
+
+                if G.s3:
+                    os.lseek(G.vol, G.device_size, os.SEEK_SET)
+                    os.write(G.vol, struct.pack('!Q', G.log_index))
+                    os.fsync(G.vol)
 
             with G.send_lock:
                 # Everything done
@@ -81,7 +85,8 @@ def backup():
                 for offset, octets, response in batch:
                     G.conn.sendall(response)
         else:
-            time.sleep(0.1)
+            log('waiting for next write batch')
+            G.batch_event.wait()
 
 
 def recvall(socket, length):
@@ -142,6 +147,7 @@ def server(socket_path, device_size):
 
             with G.batch_lock:
                 G.batch.append((offset, octets, response_header))
+                G.batch_event.set()
 
 
 class NBD:
