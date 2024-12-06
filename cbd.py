@@ -17,7 +17,6 @@ class G:
     vol = None
     conn = None
     batch = list()
-    bucket = None
     volume = None
     log_index = None
     device_size = None
@@ -25,6 +24,27 @@ class G:
     batch_lock = threading.Lock()
     volume_lock = threading.Lock()
     batch_event = threading.Event()
+
+
+class S3Bucket:
+    def __init__(self, s3bucket, key_id, secret_key):
+        tmp = s3bucket.split('/')
+        self.bucket = tmp[-1]
+        self.endpoint = '/'.join(tmp[:-1])
+
+        self.s3 = boto3.client('s3', endpoint_url=self.endpoint,
+                               aws_access_key_id=key_id,
+                               aws_secret_access_key=secret_key)
+
+    def get(self, key):
+        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        octets = obj['Body'].read()
+        assert (len(octets) == obj['ContentLength'])
+        return octets
+
+    def put(self, key, value, content_type='application/octet-stream'):
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
+                           ContentType=content_type)
 
 
 def backup():
@@ -49,19 +69,11 @@ def backup():
             body = b''.join(body)
 
             if G.s3:
-                # Upload it to Object Store
-                G.s3.put_object(
-                    Bucket=G.bucket,
-                    Key=G.volume + '/logs/' + str(G.log_index),
-                    Body=body,
-                    ContentType='application/octet-stream')
-
-                # Update the volume details in the Object Store
-                G.s3.put_object(
-                    Bucket=G.bucket,
-                    Key=G.volume + '/details.json',
-                    Body=json.dumps(dict(log_index=G.log_index)),
-                    ContentType='application/json')
+                # Upload the octets to log and log_index to details.json
+                G.s3.put(G.volume + '/logs/' + str(G.log_index), body)
+                G.s3.put(G.volume + '/details.json',
+                         json.dumps(dict(log_index=G.log_index)),
+                         'application/json')
 
                 log('uploaded({}) size({})'.format(G.log_index, len(body)))
 
@@ -192,7 +204,7 @@ def device_init(dev, block_size, block_count, timeout, socket_path):
     fcntl.ioctl(fd, NBD.DO_IT)
 
 
-def main(device_path, block_size, block_count, timeout, volume_path, s3path):
+def main(device_path, block_size, block_count, timeout, volume_path, s3bucket):
     if volume_path:
         if not os.path.isfile(volume_path):
             fd = os.open(volume_path, os.O_CREAT | os.O_RDWR)
@@ -214,25 +226,14 @@ def main(device_path, block_size, block_count, timeout, volume_path, s3path):
         log('volume({}) size({}) log_index({})'.format(
             volume_path, G.device_size, G.log_index))
 
-    if s3path and volume_path:
-        tmp = s3path.split('/')
-        endpoint, G.bucket = '/'.join(tmp[:-1]), tmp[-1]
+    if s3bucket and volume_path:
+        G.s3 = S3Bucket(s3bucket, '1DPFNzs3yeEyrQepgERD',
+                        'GydnuHxjwtHHoNEEDyav7C2LRK2LbyHaeX9msnvg')
 
-        G.s3 = boto3.client(
-            's3', endpoint_url=endpoint,
-            aws_access_key_id='1DPFNzs3yeEyrQepgERD',
-            aws_secret_access_key='GydnuHxjwtHHoNEEDyav7C2LRK2LbyHaeX9msnvg')
+        details = json.loads(G.s3.get(G.volume + '/details.json'))
 
-        obj = G.s3.get_object(Bucket=G.bucket, Key=G.volume + '/details.json')
-        max_log_index = json.loads(obj['Body'].read())['log_index']
-
-        for log_index in range(G.log_index+1, max_log_index+1):
-            obj = G.s3.get_object(
-                Bucket=G.bucket,
-                Key=G.volume + '/logs/' + str(log_index))
-            body = obj['Body'].read()
-
-            assert (len(body) == obj['ContentLength'])
+        for log_index in range(G.log_index+1, details['log_index']+1):
+            body = G.s3.get(G.volume + '/logs/' + str(log_index))
 
             i = 0
             while i < len(body):
@@ -248,10 +249,10 @@ def main(device_path, block_size, block_count, timeout, volume_path, s3path):
 
         os.fsync(G.vol)
         os.lseek(G.vol, G.device_size, os.SEEK_SET)
-        os.write(G.vol, struct.pack('!Q', max_log_index))
+        os.write(G.vol, struct.pack('!Q', details['log_index']))
         os.fsync(G.vol)
 
-        G.log_index = max_log_index
+        G.log_index = details['log_index']
 
     if volume_path:
         socket_path = hashlib.md5(device_path.encode() + volume_path.encode())
@@ -291,10 +292,10 @@ if __name__ == '__main__':
         help='File for keeping a volume')
 
     ARGS.add_argument(
-        '--s3path',
-        help='s3path for this volume')
+        '--s3bucket',
+        help='s3bucket for this volume')
 
     ARGS = ARGS.parse_args()
 
     main(ARGS.device, ARGS.block_size, ARGS.block_count,
-         ARGS.timeout, ARGS.volume, ARGS.s3path)
+         ARGS.timeout, ARGS.volume, ARGS.s3bucket)
