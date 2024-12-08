@@ -88,9 +88,12 @@ def backup():
                 # Everything done
                 # We can acknowledge the write request now
                 for vol_id, offset, octets, conn, response in batch:
-                    conn.sendall(response)
+                    try:
+                        conn.sendall(response)
+                    except Exception as e:
+                        log('volume(%d) exception(%s)', vol_id, e)
         else:
-            time.sleep(0.1)
+            time.sleep(0.01)
 
 
 def recvall(conn, length):
@@ -112,14 +115,13 @@ def server(conn):
     req = json.loads(recvall(conn, struct.unpack('!Q', recvall(conn, 8))[0]))
     vol_id = req['volume_id']
 
-    log('volume_id(%d)', vol_id)
+    log('volume(%d)', vol_id)
 
     if vol_id not in G.volumes:
         path = os.path.join(G.volumes_dir, str(vol_id))
-        if not os.path.isfile(path):
-            G.volumes[vol_id] = os.open(path, os.O_RDWR | os.O_CREAT)
-        else:
-            G.volumes[vol_id] = os.open(path, os.O_RDWR)
+        G.volumes[vol_id] = os.open(path, os.O_CREAT | os.O_RDWR)
+        os.lseek(G.volumes[vol_id], req['size'], os.SEEK_SET)
+        os.write(G.volumes[vol_id], json.dumps(req).encode())
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -138,8 +140,6 @@ def server(conn):
             with G.volume_lock:
                 os.lseek(G.volumes[vol_id], offset, os.SEEK_SET)
                 octets = os.read(G.volumes[vol_id], length)
-                if len(octets) == 0:
-                    octets = b'\x00' * length
                 assert (len(octets) == length)
 
             with G.send_lock:
@@ -158,6 +158,7 @@ def server(conn):
 
 def main(port, volumes_dir, config):
     G.volumes_dir = volumes_dir
+    os.makedirs(G.volumes_dir, exist_ok=True)
 
     if 's3bucket' in config:
         G.s3 = S3Bucket(config['s3bucket'], config['s3bucket_auth_key'],
@@ -170,26 +171,21 @@ def main(port, volumes_dir, config):
 
             i = 0
             while i < len(body):
-                volume_id, offset, length = struct.unpack('!QQQ', body[i:i+24])
+                vol_id, offset, length = struct.unpack('!QQQ', body[i:i+24])
                 octets = body[i+24:i+24+length]
                 i += 24 + length
 
-                if volume_id not in G.volumes:
-                    path = os.path.join(volumes_dir, str(volume_id))
-                    if not os.path.isfile(path):
-                        fd = os.open(path, os.O_RDWR | os.O_CREAT)
-                    else:
-                        fd = os.open(path, os.O_RDWR)
+                if vol_id not in G.volumes:
+                    path = os.path.join(volumes_dir, str(vol_id))
+                    G.volumes[vol_id] = os.open(path, os.O_CREAT | os.O_RDWR)
 
-                    G.volumes[volume_id] = fd
-
-                os.lseek(G.volumes[volume_id], offset, os.SEEK_SET)
-                os.write(G.volumes[volume_id], octets)
+                os.lseek(G.volumes[vol_id], offset, os.SEEK_SET)
+                os.write(G.volumes[vol_id], octets)
 
                 log('lsn({}) volume({}) offset({}) length({})'.format(
-                    lsn, volume_id, offset, length))
+                    lsn, vol_id, offset, length))
 
-        for volume_id, fd in G.volumes.items():
+        for vol_id, fd in G.volumes.items():
             os.fsync(fd)
 
         G.log['applied'] = G.log['total']

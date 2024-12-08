@@ -41,11 +41,12 @@ def main(dev, block_size, block_count, timeout, volume_id, host, port):
     while True:
         try:
             sock.connect((host, port))
-            octets = json.dumps(dict(volume_id=volume_id)).encode()
+            details = dict(volume_id=volume_id, size=block_size*block_count)
+            octets = json.dumps(details).encode()
             sock.sendall(struct.pack('!Q', len(octets)))
             sock.sendall(octets)
-            log('connected(%s) volume_id(%d) host(%s) port(%s)',
-                dev, volume_id, host, port)
+            log('connected(%s) volume_id(%d) size(%d) host(%s) port(%s)',
+                dev, volume_id, details['size'], host, port)
             break
         except Exception as e:
             log(e)
