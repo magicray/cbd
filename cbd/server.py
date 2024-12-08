@@ -33,16 +33,22 @@ class S3Bucket:
                                aws_secret_access_key=secret_key)
 
     def get(self, key):
+        ts = time.time()
         key = 'Cloud Block Devices/' + key
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         octets = obj['Body'].read()
         assert (len(octets) == obj['ContentLength'])
+        log('get(%s/%s) length(%d) millisec(%d)',
+            self.bucket, key, len(octets), (time.time()-ts) * 1000)
         return octets
 
     def put(self, key, value, content_type='application/octet-stream'):
+        ts = time.time()
         key = 'Cloud Block Devices/' + key
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
                            ContentType=content_type)
+        log('put(%s/%s) length(%d) millisec(%d)',
+            self.bucket, key, len(value), (time.time()-ts) * 1000)
 
 
 def backup():
@@ -112,16 +118,22 @@ def recvall(conn, length):
 
 
 def server(conn):
-    req = json.loads(recvall(conn, struct.unpack('!Q', recvall(conn, 8))[0]))
-    vol_id = req['volume_id']
+    hdr_len = struct.unpack('!Q', recvall(conn, 8))[0]
+    hdr_octets = recvall(conn, hdr_len)
+    hdr = json.loads(hdr_octets.decode())
 
-    log('volume(%d)', vol_id)
+    log('volume_id(%d) block_size(%d) block_count(%d)',
+        hdr['volume_id'], hdr['block_size'], hdr['block_count'])
+
+    vol_id = hdr['volume_id']
+    device_size = hdr['block_size'] * hdr['block_count']
 
     if vol_id not in G.volumes:
         path = os.path.join(G.volumes_dir, str(vol_id))
         G.volumes[vol_id] = os.open(path, os.O_CREAT | os.O_RDWR)
-        os.lseek(G.volumes[vol_id], req['size'], os.SEEK_SET)
-        os.write(G.volumes[vol_id], json.dumps(req).encode())
+        os.lseek(G.volumes[vol_id], device_size, os.SEEK_SET)
+        os.write(G.volumes[vol_id], struct.pack('!Q', hdr_len))
+        os.write(G.volumes[vol_id], hdr_octets)
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
