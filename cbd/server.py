@@ -38,8 +38,9 @@ class S3Bucket:
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         octets = obj['Body'].read()
         assert (len(octets) == obj['ContentLength'])
-        log('get(%s/%s) length(%d) millisec(%d)',
-            self.bucket, key, len(octets), (time.time()-ts) * 1000)
+        log('s3(%s) get(%s/%s) length(%d) msec(%d)',
+            self.endpoint, self.bucket, key, len(octets),
+            (time.time()-ts) * 1000)
         return octets
 
     def put(self, key, value, content_type='application/octet-stream'):
@@ -47,8 +48,9 @@ class S3Bucket:
         key = 'Cloud Block Devices/' + key
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
                            ContentType=content_type)
-        log('put(%s/%s) length(%d) millisec(%d)',
-            self.bucket, key, len(value), (time.time()-ts) * 1000)
+        log('s3(%s) put(%s/%s) length(%d) msec(%d)',
+            self.endpoint, self.bucket, key, len(value),
+            (time.time()-ts) * 1000)
 
 
 def backup():

@@ -66,7 +66,7 @@ if __name__ == '__main__':
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument(
-        '--device',
+        '--device', default='/dev/nbd0',
         help='Network Block Device path')
 
     ARGS.add_argument(
@@ -82,7 +82,7 @@ if __name__ == '__main__':
         help='Timeout in seconds')
 
     ARGS.add_argument(
-        '--volume_id', type=int,
+        '--volume_id', type=int, default=0,
         help='Volume ID - integer that identifies the volume')
 
     ARGS.add_argument(
