@@ -1,6 +1,7 @@
 import os
-import json
 import time
+import json
+import uuid
 import boto3
 import fcntl
 import struct
@@ -11,10 +12,9 @@ import threading
 from logging import critical as log
 
 
-
-def device_init(dev, block_size, block_count, timeout, conn):
-    # Network Block Device ioctl commands
+def device_init(dev, block_size, block_count, conn):
     # Value = (0xab << 8) + n
+    # Network Block Device ioctl commands
     NBD_SET_SOCK = 43776
     NBD_SET_BLKSIZE = 43777
     NBD_SET_SIZE = 43778
@@ -33,7 +33,7 @@ def device_init(dev, block_size, block_count, timeout, conn):
     fcntl.ioctl(fd, NBD_CLEAR_SOCK)
     fcntl.ioctl(fd, NBD_SET_BLKSIZE, block_size)
     fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, block_count)
-    fcntl.ioctl(fd, NBD_SET_TIMEOUT, timeout)
+    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 30)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
@@ -56,9 +56,10 @@ class S3:
 
         self.snapshot_min = self.log_min = 2**64
         self.snapshot_max = self.log_max = -1
+        self.size = 0
 
         res = self.s3.list_objects(Bucket=self.bucket, Prefix=prefix)
-        for obj in res['Contents']:
+        for obj in res.get('Contents', []):
             key, size = obj['Key'], obj['Size']
 
             tmp = key.split('/')
@@ -68,6 +69,8 @@ class S3:
             elif tmp[-2] == 'snapshots':
                 self.snapshot_min = min(self.snapshot_min, int(tmp[-1]))
                 self.snapshot_max = max(self.snapshot_max, int(tmp[-1]))
+
+            self.size += size
 
         log('endpoint(%s) bucket(%s) log(%s) log(%d, %d) snapshot(%d, %d)',
             endpoint, bucket, prefix,
@@ -134,11 +137,7 @@ def backup(s3, snapshot_fd, lsn, shared_batch, locks):
                 # Everything done
                 # We can acknowledge the write request now
                 for offset, octets, conn, response in batch:
-                    try:
-                        conn.sendall(response)
-                    except Exception as e:
-                        log('volume(%d) exception(%s)', vol_id, e)
-                        sys.exit(1)
+                    conn.sendall(response)
         else:
             time.sleep(0.01)
 
@@ -150,7 +149,7 @@ def recvall(conn, length):
 
         if not octets:
             conn.close()
-            raise Exception('Connection closed')
+            raise Exception('connection closed')
 
         buf.append(octets)
         length -= len(octets)
@@ -158,14 +157,9 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
-def server(s3, snapshot_fd, batch, locks):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 5000))
-    sock.listen(1)
-    log('Server started')
-
+def server(sock, s3, snapshot_fd, batch, locks):
     conn, peer = sock.accept()
-    log('Connection accepted from %s', peer)
+    log('client connection accepted')
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -205,9 +199,6 @@ def main():
 
     ARGS = argparse.ArgumentParser()
 
-    ARGS.add_argument('--port', type=int, default='10809',
-                      help='server port')
-
     ARGS.add_argument(
         '--device', default='/dev/nbd0',
         help='Network Block Device path')
@@ -221,53 +212,48 @@ def main():
         help='Device Block Count')
 
     ARGS.add_argument(
-        '--timeout', type=int, default=60,
-        help='Timeout in seconds')
-
-    ARGS.add_argument(
-        '--volume_id', default='test_cbd',
-        help='Volume ID - Unique volume identifier')
+        '--prefix', default='test/default',
+        help='path prefix in s3 bucket')
 
     ARGS = ARGS.parse_args()
 
     batch = dict(batch=list())
-    locks = dict(
-        send=threading.Lock(),
-        batch=threading.Lock(),
-        volume=threading.Lock())
+    locks = dict(send=threading.Lock(),
+                 batch=threading.Lock(),
+                 volume=threading.Lock())
 
     # Validate the requested parameter
     # This is required to avoid overwriting data
-    s3 = S3(ARGS.volume_id,
+    s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
             os.environ['CBD_S3_AUTH_KEY'], os.environ['CBD_S3_AUTH_SECRET'])
 
     for i in range(2):
-        octets = s3.read('{}/profile'.format(ARGS.volume_id))
+        octets = s3.read('profile.json')
         if octets is None:
             octets = json.dumps(dict(
-                volume_id=ARGS.volume_id,
+                uuid=str(uuid.uuid4()),
                 block_size=ARGS.block_size,
                 block_count=ARGS.block_count)).encode()
 
-            s3.create('{}/profile'.format(ARGS.volume_id), octets)
+            s3.create('profile.json', octets)
         else:
             profile = json.loads(octets.decode())
             break
 
-    if ((profile['volume_id'] != ARGS.volume_id) or
-        (profile['block_size'] != ARGS.block_size) or
-        (profile['block_count'] != ARGS.block_count)):
+    if ((profile['block_size'] != ARGS.block_size) or
+       (profile['block_count'] != ARGS.block_count)):
 
-        log('volume profile mismatch')
-        sys.exit(1)
+        log('block size or count mismatch')
+        os._exit(1)
 
     if -1 == s3.snapshot_max:
         # Binary mode, truncate if it exists
-        snapshot_fd = open(ARGS.volume_id, 'wb+')
-        snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
+        snapshot_fd = open('cbd.snapshot.' + profile['uuid'], 'wb+')
+        snapshot_fd.seek(ARGS.block_size*ARGS.block_count-1)
         snapshot_fd.write(b'0')
 
+    lsn = 0
     for lsn in range(s3.log_min, s3.log_max+1):
         body = s3.read('logs/{}'.format(lsn))
 
@@ -281,25 +267,31 @@ def main():
             snapshot_fd.write(octets)
 
             log('volume({}) lsn({}) offset({}) length({})'.format(
-                ARGS.volume_id, lsn, offset, length))
+                ARGS.prefix, lsn, offset, length))
 
-    # Start the server and backup threads
-    threading.Thread(target=server, args=(s3, snapshot_fd, batch, locks)).start()
-    threading.Thread(target=backup, args=(s3, snapshot_fd, lsn, batch, locks)).start()
+    os.fsync(snapshot_fd.fileno())
 
-    client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    while True:
-        try:
-            client_sock.connect(('127.0.0.1', 5000))
-            break
-        except Exception as e:
-            log(e)
-            time.sleep(1)
+    # Start the server thread
+    sock_path = os.path.join('/tmp', str(uuid.uuid4()))
+    server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server_sock.bind(sock_path)
+    server_sock.listen(1)
+    log('server listening on sock(%s)', sock_path)
 
-    log('connected')
+    args = (server_sock, s3, snapshot_fd, batch, locks)
+    threading.Thread(target=server, args=args).start()
 
+    # Start the backup thread
+    args = (s3, snapshot_fd, lsn, batch, locks)
+    threading.Thread(target=backup, args=args).start()
+
+    client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client_sock.connect(sock_path)
+    os.remove(sock_path)
+
+    # Initialize the device and block
     device_init(ARGS.device, ARGS.block_size, ARGS.block_count,
-                ARGS.timeout, client_sock.fileno())
+                client_sock.fileno())
 
 
 if __name__ == '__main__':
