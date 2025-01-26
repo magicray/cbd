@@ -72,17 +72,18 @@ class S3:
 
             self.size += size
 
-        log('endpoint(%s) bucket(%s) log(%s) log(%d, %d) snapshot(%d, %d)',
+        log('bucket(%s/%s) prefix(%s) log(%d, %d) snapshot(%d, %d) size(%d)',
             endpoint, bucket, prefix,
             self.log_min, self.log_max,
-            self.snapshot_min, self.snapshot_max)
+            self.snapshot_min, self.snapshot_max,
+            self.size)
 
     def create(self, key, value):
         ts = time.time()
         key = os.path.join(self.prefix, key)
         self.s3.put_object(Bucket=self.bucket, Key=key, Body=value,
                            IfNoneMatch='*')
-        log('s3(%s) bucket(%s) create(%s) length(%d) msec(%d)',
+        log('bucket(%s/%s) create(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
 
@@ -97,7 +98,7 @@ class S3:
         except self.s3.exceptions.NoSuchKey:
             octets = ''
 
-        log('s3(%s) bucket(%s) read(%s) length(%d) msec(%d)',
+        log('bucket(%s/%s) read(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(octets),
             (time.time()-ts) * 1000)
 
@@ -117,7 +118,7 @@ def backup(s3, snapshot_fd, lsn, shared_batch, locks):
         if batch:
             # Build a combined blob from all the pending writes
             body = list()
-            for offset, octets, conn, response in batch:
+            for offset, octets, conn, response, ts in batch:
                 body.append(struct.pack('!QQ', offset, len(octets)))
                 body.append(octets)
             body = b''.join(body)
@@ -129,15 +130,18 @@ def backup(s3, snapshot_fd, lsn, shared_batch, locks):
             with locks['volume']:
                 # Take the lock before updating the snapshot to ensure
                 # that read requests do not send garbled data
-                for offset, octets, conn, response in batch:
+                for offset, octets, conn, response, ts in batch:
                     snapshot_fd.seek(offset, os.SEEK_SET)
                     snapshot_fd.write(octets)
 
+            os.fsync(snapshot_fd.fileno())
+
             with locks['send']:
-                # Everything done
-                # We can acknowledge the write request now
-                for offset, octets, conn, response in batch:
+                # Everything done, acknowledge the write request
+                for offset, octets, conn, response, ts in batch:
                     conn.sendall(response)
+                    log('write(%d) offset(%d) length(%d) msec(%d)',
+                        lsn, offset, len(octets), (time.time()-ts)*1000)
         else:
             time.sleep(0.01)
 
@@ -165,10 +169,9 @@ def server(sock, s3, snapshot_fd, batch, locks):
         magic, flags, cmd, cookie, offset, length = struct.unpack(
             '!IHHQQI', recvall(conn, 28))
 
+        ts = time.time()
         assert (0x25609513 == magic)           # Valid request header
         assert (cmd in (0, 1))                 # Only 0:read or 1:write
-
-        log('cmd(%d) offset(%d) length(%d)', cmd, offset, length)
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
@@ -184,14 +187,22 @@ def server(sock, s3, snapshot_fd, batch, locks):
                 conn.sendall(response_header)
                 conn.sendall(octets)
 
+            log('read offset(%d) length(%d) msec(%d)',
+                offset, length, (time.time()-ts)*1000)
+
         # WRITE - put the required data in the next batch
         # Backup thread would store the entire batch on the
         # cloud and then send the response back.
-        if 1 == cmd:
+        elif 1 == cmd:
             octets = recvall(conn, length)
 
             with locks['batch']:
-                batch['batch'].append((offset, octets, conn, response_header))
+                batch['batch'].append((offset, octets, conn,
+                                       response_header, ts))
+
+        else:
+            log('cmd(%d) offset(%d) length(%d) msec(%d)',
+                cmd, offset, length, (time.time()-ts)*1000)
 
 
 def main():
@@ -271,25 +282,27 @@ def main():
 
     os.fsync(snapshot_fd.fileno())
 
-    # Start the server thread
+    # Start the backup thread
+    args = (s3, snapshot_fd, lsn, batch, locks)
+    threading.Thread(target=backup, args=args).start()
+
+    # Initialize the unix domain server socket
     sock_path = os.path.join('/tmp', str(uuid.uuid4()))
     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server_sock.bind(sock_path)
     server_sock.listen(1)
     log('server listening on sock(%s)', sock_path)
 
+    # Start the server thread
     args = (server_sock, s3, snapshot_fd, batch, locks)
     threading.Thread(target=server, args=args).start()
 
-    # Start the backup thread
-    args = (s3, snapshot_fd, lsn, batch, locks)
-    threading.Thread(target=backup, args=args).start()
-
+    # Initialize the client socket, to be attached to the nbd device
     client_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client_sock.connect(sock_path)
     os.remove(sock_path)
 
-    # Initialize the device and block
+    # Initialize the device, attach the client socket created above
     device_init(ARGS.device, ARGS.block_size, ARGS.block_count,
                 client_sock.fileno())
 
