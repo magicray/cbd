@@ -161,97 +161,136 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
+def ASSERT(condition):
+    assert condition
+
+    if not condition:
+        log('assert triggered. exiting...')
+        os._exit(1)
+
+
+blob_fd_cache = dict()
+def blob_io(offset, block=None):
+    blob_num = (offset // ARGS.blob_size) * ARGS.blob_size
+
+    if block:
+        blob_path = os.path.join(ARGS.volume_dir, 'latest', str(blob_num))
+    else:
+        dirs = ['latest']
+        checkpoints = os.listdir(ARGS.volume_dir)
+        dirs.extend(sorted([int(d) for d in checkpoints if d.isdigit()]))
+        dirs.extend(['oldest'])
+
+        blob_path = None
+        for d in dirs:
+            tmp = os.path.join(ARGS.volume_dir, d, str(blob_num))
+            if os.path.isfile(tmp):
+                blob_path = tmp
+                break
+
+    if blob_path is None and block is None:
+        return b'\0' * ARGS.block_size
+
+    if blob_path not in blob_fd_cache:
+        if block:
+            fd = os.open(blob_path, os.O_CREAT | os.O_RDWR)
+        else:
+            fd = os.open(blob_path, os.O_RDWR)
+
+        blob_fd_cache[blob_path] = fd
+
+    fd = blob_fd_cache[blob_path]
+    os.lseek(fd, offset-blob_num, os.SEEK_SET)
+
+    if block:
+        return os.write(fd, block)
+    else:
+        return os.read(fd, ARGS.block_size)
+
+
 def server(sock, s3, snapshot_fd, batch, locks):
     conn, peer = sock.accept()
     log('client connection accepted')
+
+    os.makedirs(os.path.join(ARGS.volume_dir, 'latest'), exist_ok=True)
+    os.makedirs(os.path.join(ARGS.volume_dir, 'oldest'), exist_ok=True)
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
             '!IHHQQI', recvall(conn, 28))
 
         ts = time.time()
-        assert (0x25609513 == magic)           # Valid request header
-        assert (cmd in (0, 1))                 # Only 0:read or 1:write
+        ASSERT(0x25609513 == magic)           # Valid request header
+        ASSERT(cmd in (0, 1))                 # Only 0:read or 1:write
+
+        ASSERT(offset % ARGS.block_size == 0)
+        ASSERT(length % ARGS.block_size == 0)
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
-        # READ - send the data from the volume
+        # READ
         if 0 == cmd:
-            with locks['volume']:
-                snapshot_fd.seek(offset, os.SEEK_SET)
-                octets = snapshot_fd.read(length)
-                assert (len(octets) == length)
+            blocks = list()
 
-            with locks['send']:
-                conn.sendall(response_header)
-                conn.sendall(octets)
+            for i in range(length // ARGS.block_size):
+                blocks.append(blob_io(offset + i*ARGS.block_size))
+
+                if 0 == len(blocks[-1]):
+                    blocks[-1] = b'\0' * ARGS.block_size
+
+                ASSERT(len(blocks[-1]) == ARGS.block_size)
+
+            conn.sendall(response_header)
+            conn.sendall(b''.join(blocks))
 
             log('read offset(%d) length(%d) msec(%d)',
                 offset, length, (time.time()-ts)*1000)
 
-        # WRITE - put the required data in the next batch
-        # Backup thread would store the entire batch on the
-        # cloud and then send the response back.
+        # WRITE
         elif 1 == cmd:
             octets = recvall(conn, length)
 
-            with locks['batch']:
-                batch['batch'].append((offset, octets, conn,
-                                       response_header, ts))
+            for i in range(len(octets) // ARGS.block_size):
+                block = octets[i*ARGS.block_size : (i+1)*ARGS.block_size]
 
+                blob_io(offset+i*ARGS.block_size, block)
+
+            conn.sendall(response_header)
+
+            log('write offset(%d) length(%d) msec(%d)',
+                offset, length, (time.time()-ts)*1000)
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
+            os._exit(0)
 
 
 def main():
-    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
-
-    ARGS = argparse.ArgumentParser()
-
-    ARGS.add_argument(
-        '--device', default='/dev/nbd0',
-        help='Network Block Device path')
-
-    ARGS.add_argument(
-        '--block_size', type=int, default=4096,
-        help='Device Block Size')
-
-    ARGS.add_argument(
-        '--block_count', type=int, default=256*1024,
-        help='Device Block Count')
-
-    ARGS.add_argument(
-        '--prefix', default='test/default',
-        help='path prefix in s3 bucket')
-
-    ARGS = ARGS.parse_args()
-
+    """
     batch = dict(batch=list())
     locks = dict(send=threading.Lock(),
                  batch=threading.Lock(),
                  volume=threading.Lock())
 
-    # Validate the requested parameter
-    # This is required to avoid overwriting data
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
             os.environ['CBD_S3_AUTH_KEY'], os.environ['CBD_S3_AUTH_SECRET'])
 
-    for i in range(2):
+    # Read the volume profile from S3
+    octets = s3.read('profile.json')
+    if octets is None:
+        s3.create('profile.json', json.dumps(dict(
+            uuid=str(uuid.uuid4()),
+            block_size=ARGS.block_size,
+            block_count=ARGS.block_count)).encode())
+
         octets = s3.read('profile.json')
-        if octets is None:
-            octets = json.dumps(dict(
-                uuid=str(uuid.uuid4()),
-                block_size=ARGS.block_size,
-                block_count=ARGS.block_count)).encode()
 
-            s3.create('profile.json', octets)
-        else:
-            profile = json.loads(octets.decode())
-            break
+    profile = json.loads(octets.decode())
 
+    # Validate the block_size and block_count
+    # This is required to avoid corrupting data
     if ((profile['block_size'] != ARGS.block_size) or
        (profile['block_count'] != ARGS.block_count)):
 
@@ -261,12 +300,17 @@ def main():
     if -1 == s3.snapshot_max:
         # Binary mode, truncate if it exists
         snapshot_fd = open('cbd.snapshot.' + profile['uuid'], 'wb+')
-        snapshot_fd.seek(ARGS.block_size*ARGS.block_count-1)
-        snapshot_fd.write(b'0')
+        snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
+        snapshot_fd.write(struct.pack('!Q', 0))
+    else:
+        snapshot_fd = open('cbd.snapshot.' + profile['uuid'], 'r+b')
 
-    lsn = 0
-    for lsn in range(s3.log_min, s3.log_max+1):
-        body = s3.read('logs/{}'.format(lsn))
+    snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
+    synced = struct.unpack('!Q', snapshot_fd.read(8))[0]
+    lsn = synced + 1
+
+    for n in range(lsn, s3.log_max+1):
+        body = s3.read('logs/{}'.format(n))
 
         i = 0
         while i < len(body):
@@ -277,14 +321,18 @@ def main():
             snapshot_fd.seek(offset)
             snapshot_fd.write(octets)
 
+            synced = n
             log('volume({}) lsn({}) offset({}) length({})'.format(
-                ARGS.prefix, lsn, offset, length))
+                ARGS.prefix, n, offset, length))
 
     os.fsync(snapshot_fd.fileno())
+    snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
+    snapshot_fd.write(struct.pack('!Q', synced))
+    """
 
     # Start the backup thread
-    args = (s3, snapshot_fd, lsn, batch, locks)
-    threading.Thread(target=backup, args=args).start()
+    #args = (s3, snapshot_fd, synced, batch, locks)
+    #threading.Thread(target=backup, args=args).start()
 
     # Initialize the unix domain server socket
     sock_path = os.path.join('/tmp', str(uuid.uuid4()))
@@ -294,6 +342,10 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
+    s3 = None
+    snapshot_fd = None
+    batch = None
+    locks = None
     args = (server_sock, s3, snapshot_fd, batch, locks)
     threading.Thread(target=server, args=args).start()
 
@@ -308,4 +360,27 @@ def main():
 
 
 if __name__ == '__main__':
+    logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
+
+    ARGS = argparse.ArgumentParser()
+
+    ARGS.add_argument('--device', default='/dev/nbd0',
+        help='Network Block Device path')
+
+    ARGS.add_argument('--block_size', type=int, default=4096,
+        help='Device Block Size')
+
+    ARGS.add_argument('--block_count', type=int, default=256*1024,
+        help='Device Block Count')
+
+    ARGS.add_argument('--volume_dir', default='volume',
+        help='volume write area')
+
+    ARGS.add_argument('--blob_size', default=64*1024*1024,
+        help='blob size')
+
+    ARGS = ARGS.parse_args()
+
+    ASSERT(ARGS.blob_size % ARGS.block_size == 0)
+
     main()
