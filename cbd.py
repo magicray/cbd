@@ -1,12 +1,12 @@
 import os
 import time
-import json
 import uuid
 import boto3
 import fcntl
 import struct
 import socket
 import logging
+import hashlib
 import argparse
 import threading
 from logging import critical as log
@@ -17,7 +17,7 @@ def device_init(dev, block_size, block_count, conn):
     # Network Block Device ioctl commands
     NBD_SET_SOCK = 43776
     NBD_SET_BLKSIZE = 43777
-    NBD_SET_SIZE = 43778
+    # NBD_SET_SIZE = 43778
     NBD_DO_IT = 43779
     NBD_CLEAR_SOCK = 43780
     NBD_CLEAR_QUEUE = 43781
@@ -25,7 +25,7 @@ def device_init(dev, block_size, block_count, conn):
     NBD_SET_SIZE_BLOCKS = 43783
     NBD_DISCONNECT = 43784
     NBD_SET_TIMEOUT = 43785
-    NBD_SET_FLAGS = 43786
+    # NBD_SET_FLAGS = 43786
 
     fd = os.open(dev, os.O_RDWR)
     fcntl.ioctl(fd, NBD_CLEAR_QUEUE)
@@ -170,8 +170,12 @@ def ASSERT(condition):
 
 
 blob_fd_cache = dict()
+
+
 def blob_io(offset, block=None):
-    blob_num = (offset // ARGS.blob_size) * ARGS.blob_size
+    blob_size = ARGS.blocks_per_blob * ARGS.block_size
+
+    blob_num = (offset // blob_size) * blob_size
 
     if block:
         blob_path = os.path.join(ARGS.volume_dir, 'latest', str(blob_num))
@@ -200,18 +204,31 @@ def blob_io(offset, block=None):
         blob_fd_cache[blob_path] = fd
 
     fd = blob_fd_cache[blob_path]
-    os.lseek(fd, offset-blob_num, os.SEEK_SET)
+
+    block_index = (offset - blob_num) // ARGS.block_size
+    blob_offset = block_index * (ARGS.block_size + 32)
+    os.lseek(fd, blob_offset, os.SEEK_SET)
 
     if block:
-        return os.write(fd, block)
+        checksum = hashlib.sha256(block).digest()
+        return os.write(fd, block + checksum)
     else:
-        return os.read(fd, ARGS.block_size)
+        block = os.read(fd, ARGS.block_size + 32)
+
+        if hashlib.sha256(block[:-32]).digest() != block[-32:]:
+            for b in block:
+                if b != 0:
+                    log('not a zero filled block')
+                    os._exit(1)
+
+        return block[:ARGS.block_size]
 
 
 def server(sock, s3, snapshot_fd, batch, locks):
     conn, peer = sock.accept()
     log('client connection accepted')
 
+    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(ARGS.volume_dir, 'latest'), exist_ok=True)
     os.makedirs(os.path.join(ARGS.volume_dir, 'oldest'), exist_ok=True)
 
@@ -252,7 +269,7 @@ def server(sock, s3, snapshot_fd, batch, locks):
             octets = recvall(conn, length)
 
             for i in range(len(octets) // ARGS.block_size):
-                block = octets[i*ARGS.block_size : (i+1)*ARGS.block_size]
+                block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
 
                 blob_io(offset+i*ARGS.block_size, block)
 
@@ -331,8 +348,8 @@ def main():
     """
 
     # Start the backup thread
-    #args = (s3, snapshot_fd, synced, batch, locks)
-    #threading.Thread(target=backup, args=args).start()
+    # args = (s3, snapshot_fd, synced, batch, locks)
+    # threading.Thread(target=backup, args=args).start()
 
     # Initialize the unix domain server socket
     sock_path = os.path.join('/tmp', str(uuid.uuid4()))
@@ -365,22 +382,20 @@ if __name__ == '__main__':
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument('--device', default='/dev/nbd0',
-        help='Network Block Device path')
+                      help='Network Block Device path')
 
     ARGS.add_argument('--block_size', type=int, default=4096,
-        help='Device Block Size')
+                      help='Device Block Size')
 
     ARGS.add_argument('--block_count', type=int, default=256*1024,
-        help='Device Block Count')
+                      help='Device Block Count')
 
     ARGS.add_argument('--volume_dir', default='volume',
-        help='volume write area')
+                      help='volume write area')
 
-    ARGS.add_argument('--blob_size', default=64*1024*1024,
-        help='blob size')
+    ARGS.add_argument('--blocks_per_blob', default=10000,
+                      help='blocks per blob')
 
     ARGS = ARGS.parse_args()
-
-    ASSERT(ARGS.blob_size % ARGS.block_size == 0)
 
     main()
