@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+import json
 import boto3
 import fcntl
 import struct
@@ -224,13 +225,36 @@ def blob_io(offset, block=None):
         return block[:ARGS.block_size]
 
 
-def server(sock, s3, snapshot_fd, batch, locks):
+class Logger:
+    def __init__(self, logdir):
+        self.ts = 0
+        self.fd = None
+        self.logdir = logdir
+
+    def append(self, meta, data):
+        ts = int(time.time())
+
+        if ts > self.ts:
+            if self.fd:
+                os.close(self.fd)
+
+            self.ts = ts
+            self.fd = os.open(os.path.join(self.logdir, str(self.ts)),
+                              os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+        meta = json.dumps(meta, sort_keys=True).encode()
+        os.write(self.fd, b'\n'.join([meta, data, b'']))
+
+
+def server(sock):
     conn, peer = sock.accept()
     log('client connection accepted')
 
     os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(ARGS.volume_dir, 'latest'), exist_ok=True)
     os.makedirs(os.path.join(ARGS.volume_dir, 'oldest'), exist_ok=True)
+
+    logger = Logger(os.path.join(ARGS.volume_dir, 'logs'))
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -267,6 +291,12 @@ def server(sock, s3, snapshot_fd, batch, locks):
         # WRITE
         elif 1 == cmd:
             octets = recvall(conn, length)
+            logger.append(dict(
+                cmd='write',
+                ts=int(time.time()),
+                length=length,
+                octets_sha256=hashlib.sha256(octets).hexdigest()
+                ), octets)
 
             for i in range(len(octets) // ARGS.block_size):
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
@@ -359,11 +389,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    s3 = None
-    snapshot_fd = None
-    batch = None
-    locks = None
-    args = (server_sock, s3, snapshot_fd, batch, locks)
+    args = (server_sock, )
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
