@@ -106,7 +106,44 @@ class S3:
         return octets if octets else None
 
 
-def backup(s3, snapshot_fd, lsn, shared_batch, locks):
+class Logger:
+    def __init__(self, logdir):
+        self.ts = 0
+        self.fd = None
+        self.logdir = logdir
+
+    def append(self, meta, data):
+        ts = int(time.time())
+
+        if ts > self.ts:
+            if self.fd:
+                os.close(self.fd)
+
+            self.ts = ts
+            self.fd = os.open(os.path.join(self.logdir, str(self.ts)),
+                              os.O_CREAT | os.O_WRONLY | os.O_APPEND)
+
+        meta = json.dumps(meta, sort_keys=True).encode()
+        os.write(self.fd, b'\n'.join([meta, data, b'']))
+
+
+def backup(batch, batch_lock):
+    logger = Logger(os.path.join(ARGS.volume_dir, 'logs'))
+
+    while True:
+        with batch_lock:
+            active = batch['active']
+            frozen = batch['frozen']
+
+            batch['active'] = dict()
+            batch['frozen'] = active
+
+        # Work on the frozen batch now
+        for k in frozen:
+            blob_io(k*ARGS.block_size, frozen[k]['block'])
+
+        time.sleep(1)
+
     while True:
         batch = None
 
@@ -178,30 +215,13 @@ def blob_io(offset, block=None):
 
     blob_num = (offset // blob_size) * blob_size
 
-    if block:
-        blob_path = os.path.join(ARGS.volume_dir, 'latest', str(blob_num))
-    else:
-        dirs = ['latest']
-        checkpoints = os.listdir(ARGS.volume_dir)
-        dirs.extend(sorted([int(d) for d in checkpoints if d.isdigit()]))
-        dirs.extend(['oldest'])
-
-        blob_path = None
-        for d in dirs:
-            tmp = os.path.join(ARGS.volume_dir, d, str(blob_num))
-            if os.path.isfile(tmp):
-                blob_path = tmp
-                break
+    blob_path = os.path.join(ARGS.volume_dir, 'objs', str(blob_num))
 
     if blob_path is None and block is None:
         return b'\0' * ARGS.block_size
 
     if blob_path not in blob_fd_cache:
-        if block:
-            fd = os.open(blob_path, os.O_CREAT | os.O_RDWR)
-        else:
-            fd = os.open(blob_path, os.O_RDWR)
-
+        fd = os.open(blob_path, os.O_CREAT | os.O_RDWR)
         blob_fd_cache[blob_path] = fd
 
     fd = blob_fd_cache[blob_path]
@@ -225,36 +245,9 @@ def blob_io(offset, block=None):
         return block[:ARGS.block_size]
 
 
-class Logger:
-    def __init__(self, logdir):
-        self.ts = 0
-        self.fd = None
-        self.logdir = logdir
-
-    def append(self, meta, data):
-        ts = int(time.time())
-
-        if ts > self.ts:
-            if self.fd:
-                os.close(self.fd)
-
-            self.ts = ts
-            self.fd = os.open(os.path.join(self.logdir, str(self.ts)),
-                              os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-        meta = json.dumps(meta, sort_keys=True).encode()
-        os.write(self.fd, b'\n'.join([meta, data, b'']))
-
-
-def server(sock):
+def server(sock, batch, batch_lock):
     conn, peer = sock.accept()
     log('client connection accepted')
-
-    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
-    os.makedirs(os.path.join(ARGS.volume_dir, 'latest'), exist_ok=True)
-    os.makedirs(os.path.join(ARGS.volume_dir, 'oldest'), exist_ok=True)
-
-    logger = Logger(os.path.join(ARGS.volume_dir, 'logs'))
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -270,17 +263,29 @@ def server(sock):
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
+        block_count = length // ARGS.block_size
+        block_offset = offset // ARGS.block_size
+
         # READ
         if 0 == cmd:
             blocks = list()
 
-            for i in range(length // ARGS.block_size):
-                blocks.append(blob_io(offset + i*ARGS.block_size))
+            for i in range(block_count):
+                j = block_offset + i
+                block = b''
 
-                if 0 == len(blocks[-1]):
-                    blocks[-1] = b'\0' * ARGS.block_size
+                with batch_lock:
+                    if j in batch['active']:
+                        block = batch['active'][block_offset+i]['block']
+                    elif j in batch['frozen']:
+                        block = batch['frozen'][block_offset+i]['block']
+                    else:
+                        block = blob_io(j*ARGS.block_size)
 
-                ASSERT(len(blocks[-1]) == ARGS.block_size)
+                if 0 == len(block):
+                    block = b'\0' * ARGS.block_size
+
+                blocks.append(block)
 
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
@@ -291,17 +296,16 @@ def server(sock):
         # WRITE
         elif 1 == cmd:
             octets = recvall(conn, length)
-            logger.append(dict(
-                cmd='write',
-                ts=int(time.time()),
-                length=length,
-                octets_sha256=hashlib.sha256(octets).hexdigest()
-                ), octets)
 
-            for i in range(len(octets) // ARGS.block_size):
+            for i in range(block_count):
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
+                sha256=hashlib.sha256(block).hexdigest()
 
-                blob_io(offset+i*ARGS.block_size, block)
+                with batch_lock:
+                    batch['active'][block_offset+i] = dict(
+                        block=block,
+                        length=length,
+                        sha256=sha256)
 
             conn.sendall(response_header)
 
@@ -314,6 +318,8 @@ def server(sock):
 
 
 def main():
+    batch = dict(active=dict(), frozen=dict())
+    batch_lock = threading.Lock()
     """
     batch = dict(batch=list())
     locks = dict(send=threading.Lock(),
@@ -377,9 +383,12 @@ def main():
     snapshot_fd.write(struct.pack('!Q', synced))
     """
 
+    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
+    os.makedirs(os.path.join(ARGS.volume_dir, 'objs'), exist_ok=True)
+
     # Start the backup thread
-    # args = (s3, snapshot_fd, synced, batch, locks)
-    # threading.Thread(target=backup, args=args).start()
+    args = (batch, batch_lock)
+    threading.Thread(target=backup, args=args).start()
 
     # Initialize the unix domain server socket
     sock_path = os.path.join('/tmp', str(uuid.uuid4()))
@@ -389,7 +398,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, )
+    args = (server_sock, batch, batch_lock)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
