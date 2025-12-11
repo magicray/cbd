@@ -140,7 +140,7 @@ def backup(batch, batch_lock):
 
         # Work on the frozen batch now
         for k in frozen:
-            blob_io(k*ARGS.block_size, frozen[k]['block'])
+            blob_io(k*ARGS.block_size, frozen[k])
 
         time.sleep(1)
 
@@ -199,14 +199,6 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
-def ASSERT(condition):
-    assert condition
-
-    if not condition:
-        log('assert triggered. exiting...')
-        os._exit(1)
-
-
 blob_fd_cache = dict()
 
 
@@ -231,8 +223,8 @@ def blob_io(offset, block=None):
     os.lseek(fd, blob_offset, os.SEEK_SET)
 
     if block:
-        checksum = hashlib.sha256(block).digest()
-        return os.write(fd, block + checksum)
+        os.write(fd, block['block'] + block['sha256'])
+        os.fsync(fd)
     else:
         block = os.read(fd, ARGS.block_size + 32)
 
@@ -254,11 +246,14 @@ def server(sock, batch, batch_lock):
             '!IHHQQI', recvall(conn, 28))
 
         ts = time.time()
-        ASSERT(0x25609513 == magic)           # Valid request header
-        ASSERT(cmd in (0, 1))                 # Only 0:read or 1:write
 
-        ASSERT(offset % ARGS.block_size == 0)
-        ASSERT(length % ARGS.block_size == 0)
+        if 0x25609513 != magic:
+            log(f'invalid magic({magic}) or cmd({cmd})')
+            os._exit(1)
+
+        if 0 != offset % ARGS.block_size or 0 != length % ARGS.block_size:
+            log(f'invalid offset({offset}) or length({length})')
+            os._exit(1)
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
@@ -299,7 +294,7 @@ def server(sock, batch, batch_lock):
 
             for i in range(block_count):
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                sha256=hashlib.sha256(block).hexdigest()
+                sha256 = hashlib.sha256(block).digest()
 
                 with batch_lock:
                     batch['active'][block_offset+i] = dict(
