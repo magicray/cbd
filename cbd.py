@@ -1,7 +1,6 @@
 import os
 import time
 import uuid
-import json
 import boto3
 import fcntl
 import struct
@@ -106,82 +105,24 @@ class S3:
         return octets if octets else None
 
 
-class Logger:
-    def __init__(self, logdir):
-        self.ts = 0
-        self.fd = None
-        self.logdir = logdir
-
-    def append(self, meta, data):
-        ts = int(time.time())
-
-        if ts > self.ts:
-            if self.fd:
-                os.close(self.fd)
-
-            self.ts = ts
-            self.fd = os.open(os.path.join(self.logdir, str(self.ts)),
-                              os.O_CREAT | os.O_WRONLY | os.O_APPEND)
-
-        meta = json.dumps(meta, sort_keys=True).encode()
-        os.write(self.fd, b'\n'.join([meta, data, b'']))
-
-
 def backup(batch, batch_lock):
-    logger = Logger(os.path.join(ARGS.volume_dir, 'logs'))
-
     while True:
-        with batch_lock:
-            active = batch['active']
-            frozen = batch['frozen']
-
-            batch['active'] = dict()
-            batch['frozen'] = active
-
         # Work on the frozen batch now
-        for k in frozen:
-            blob_io(k*ARGS.block_size, frozen[k])
+        for k in batch['frozen']:
+            block = batch['frozen'][k]['block']
+            sha256 = hashlib.sha256(block).digest()
+            blob_io(k*ARGS.block_size, block, sha256)
+
+        with batch_lock:
+            batch['frozen'] = batch['active']
+            batch['active'] = dict()
 
         time.sleep(1)
 
     while True:
-        batch = None
-
-        with locks['batch']:
-            if shared_batch['batch']:
-                # Take out the current batch
-                # Writer would start using the next batch
-                batch, shared_batch['batch'] = shared_batch['batch'], list()
-
-        if batch:
-            # Build a combined blob from all the pending writes
-            body = list()
-            for offset, octets, conn, response, ts in batch:
-                body.append(struct.pack('!QQ', offset, len(octets)))
-                body.append(octets)
-            body = b''.join(body)
-
-            # Upload the octets to log and log_index to details.json
-            lsn += 1
-            s3.create('logs/{}'.format(lsn), body)
-
-            with locks['volume']:
-                # Take the lock before updating the snapshot to ensure
-                # that read requests do not send garbled data
-                for offset, octets, conn, response, ts in batch:
-                    snapshot_fd.seek(offset, os.SEEK_SET)
-                    snapshot_fd.write(octets)
-
-            os.fsync(snapshot_fd.fileno())
-
-            with locks['send']:
-                # Everything done, acknowledge the write request
-                for offset, octets, conn, response, ts in batch:
-                    conn.sendall(response)
-                    log('write(%d) offset(%d) length(%d) msec(%d)',
-                        lsn, offset, len(octets), (time.time()-ts)*1000)
-        else:
-            time.sleep(0.01)
+        # Upload the octets to log and log_index to details.json
+        # s3.create('logs/{}'.format(1), body)
+        pass
 
 
 def recvall(conn, length):
@@ -202,15 +143,12 @@ def recvall(conn, length):
 blob_fd_cache = dict()
 
 
-def blob_io(offset, block=None):
+def blob_io(offset, block=None, sha256=None):
     blob_size = ARGS.blocks_per_blob * ARGS.block_size
 
     blob_num = (offset // blob_size) * blob_size
 
     blob_path = os.path.join(ARGS.volume_dir, 'objs', str(blob_num))
-
-    if blob_path is None and block is None:
-        return b'\0' * ARGS.block_size
 
     if blob_path not in blob_fd_cache:
         fd = os.open(blob_path, os.O_CREAT | os.O_RDWR)
@@ -223,16 +161,18 @@ def blob_io(offset, block=None):
     os.lseek(fd, blob_offset, os.SEEK_SET)
 
     if block:
-        os.write(fd, block['block'] + block['sha256'])
+        os.write(fd, block + sha256)
         os.fsync(fd)
     else:
         block = os.read(fd, ARGS.block_size + 32)
 
+        if not block:
+            return b'\0' * ARGS.block_size
+
         if hashlib.sha256(block[:-32]).digest() != block[-32:]:
-            for b in block:
-                if b != 0:
-                    log('not a zero filled block')
-                    os._exit(1)
+            if block != b'\0' * len(block):
+                log('not a zero filled block')
+                os._exit(1)
 
         return block[:ARGS.block_size]
 
@@ -274,11 +214,9 @@ def server(sock, batch, batch_lock):
                         block = batch['active'][block_offset+i]['block']
                     elif j in batch['frozen']:
                         block = batch['frozen'][block_offset+i]['block']
-                    else:
-                        block = blob_io(j*ARGS.block_size)
 
-                if 0 == len(block):
-                    block = b'\0' * ARGS.block_size
+                if not block:
+                    block = blob_io(j*ARGS.block_size)
 
                 blocks.append(block)
 
@@ -292,15 +230,10 @@ def server(sock, batch, batch_lock):
         elif 1 == cmd:
             octets = recvall(conn, length)
 
-            for i in range(block_count):
-                block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                sha256 = hashlib.sha256(block).digest()
-
-                with batch_lock:
-                    batch['active'][block_offset+i] = dict(
-                        block=block,
-                        length=length,
-                        sha256=sha256)
+            with batch_lock:
+                for i in range(block_count):
+                    block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
+                    batch['active'][block_offset+i] = dict(block=block)
 
             conn.sendall(response_header)
 
@@ -316,69 +249,11 @@ def main():
     batch = dict(active=dict(), frozen=dict())
     batch_lock = threading.Lock()
     """
-    batch = dict(batch=list())
-    locks = dict(send=threading.Lock(),
-                 batch=threading.Lock(),
-                 volume=threading.Lock())
-
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
             os.environ['CBD_S3_AUTH_KEY'], os.environ['CBD_S3_AUTH_SECRET'])
-
-    # Read the volume profile from S3
-    octets = s3.read('profile.json')
-    if octets is None:
-        s3.create('profile.json', json.dumps(dict(
-            uuid=str(uuid.uuid4()),
-            block_size=ARGS.block_size,
-            block_count=ARGS.block_count)).encode())
-
-        octets = s3.read('profile.json')
-
-    profile = json.loads(octets.decode())
-
-    # Validate the block_size and block_count
-    # This is required to avoid corrupting data
-    if ((profile['block_size'] != ARGS.block_size) or
-       (profile['block_count'] != ARGS.block_count)):
-
-        log('block size or count mismatch')
-        os._exit(1)
-
-    if -1 == s3.snapshot_max:
-        # Binary mode, truncate if it exists
-        snapshot_fd = open('cbd.snapshot.' + profile['uuid'], 'wb+')
-        snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
-        snapshot_fd.write(struct.pack('!Q', 0))
-    else:
-        snapshot_fd = open('cbd.snapshot.' + profile['uuid'], 'r+b')
-
-    snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
-    synced = struct.unpack('!Q', snapshot_fd.read(8))[0]
-    lsn = synced + 1
-
-    for n in range(lsn, s3.log_max+1):
-        body = s3.read('logs/{}'.format(n))
-
-        i = 0
-        while i < len(body):
-            offset, length = struct.unpack('!QQ', body[i:i+16])
-            octets = body[i+16:i+16+length]
-            i += 16 + length
-
-            snapshot_fd.seek(offset)
-            snapshot_fd.write(octets)
-
-            synced = n
-            log('volume({}) lsn({}) offset({}) length({})'.format(
-                ARGS.prefix, n, offset, length))
-
-    os.fsync(snapshot_fd.fileno())
-    snapshot_fd.seek(ARGS.block_size*ARGS.block_count)
-    snapshot_fd.write(struct.pack('!Q', synced))
     """
 
-    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(ARGS.volume_dir, 'objs'), exist_ok=True)
 
     # Start the backup thread
