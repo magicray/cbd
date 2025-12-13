@@ -114,8 +114,9 @@ def backup(batch, batch_lock):
     while True:
         # Work on the frozen batch now
         for k, v in batch['frozen'].items():
-            os.lseek(fd, k*(ARGS.block_size+32), os.SEEK_SET)
+            os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
             os.write(fd, v)
+            os.write(fd, struct.pack('!Q', k))
             os.write(fd, hashlib.sha256(v).digest())
 
         with batch_lock:
@@ -197,10 +198,16 @@ def server(sock, batch, batch_lock):
                         block = batch['frozen'][j]
 
                 if not block:
-                    os.lseek(fd, j*(ARGS.block_size+32), os.SEEK_SET)
+                    os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
 
                     block = os.read(fd, ARGS.block_size)
+                    blknum = struct.unpack('!Q', os.read(fd, 8))[0]
                     chksum = os.read(fd, 32)
+
+                    if blknum not in (0, j):
+                        log((blknum, j))
+                        log('corruption detected')
+                        os._exit(0)
 
                     if chksum != zerobuf:
                         if hashlib.sha256(block).digest() != chksum:
@@ -244,7 +251,7 @@ def main():
     os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
     fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
                  os.O_CREAT | os.O_WRONLY)
-    os.lseek(fd, (ARGS.block_size+32) * ARGS.block_count, os.SEEK_SET)
+    os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
     os.write(fd, b'CBD')
     os.close(fd)
 
