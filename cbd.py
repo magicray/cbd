@@ -106,16 +106,32 @@ class S3:
 
 
 def backup(batch, batch_lock):
+    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
+                 os.O_CREAT | os.O_WRONLY)
+
+    old_active = -1
+    old_frozen = -1
     while True:
         # Work on the frozen batch now
-        for k in batch['frozen']:
-            block = batch['frozen'][k]['block']
-            sha256 = hashlib.sha256(block).digest()
-            blob_io(k*ARGS.block_size, block, sha256)
+        for k, v in batch['frozen'].items():
+            sha256 = hashlib.sha256(v['block']).digest()
+            os.lseek(fd, k*(ARGS.block_size+32), os.SEEK_SET)
+            os.write(fd, v['block'] + sha256)
+
+        os.fsync(fd)
 
         with batch_lock:
             batch['frozen'] = batch['active']
             batch['active'] = dict()
+
+            active = len(batch['active'])
+            frozen = len(batch['frozen'])
+
+        if old_active != active or old_frozen != frozen:
+            log('active({}) frozen({})'.format(
+                len(batch['active']), len(batch['frozen'])))
+
+            old_active, old_frozen = active, frozen
 
         time.sleep(1)
 
@@ -141,45 +157,17 @@ def recvall(conn, length):
 
 
 blob_fd_cache = dict()
-
-
-def blob_io(offset, block=None, sha256=None):
-    blob_size = ARGS.blocks_per_blob * ARGS.block_size
-
-    blob_num = (offset // blob_size) * blob_size
-
-    blob_path = os.path.join(ARGS.volume_dir, 'objs', str(blob_num))
-
-    if blob_path not in blob_fd_cache:
-        fd = os.open(blob_path, os.O_CREAT | os.O_RDWR)
-        blob_fd_cache[blob_path] = fd
-
-    fd = blob_fd_cache[blob_path]
-
-    block_index = (offset - blob_num) // ARGS.block_size
-    blob_offset = block_index * (ARGS.block_size + 32)
-    os.lseek(fd, blob_offset, os.SEEK_SET)
-
-    if block:
-        os.write(fd, block + sha256)
-        os.fsync(fd)
-    else:
-        block = os.read(fd, ARGS.block_size + 32)
-
-        if not block:
-            return b'\0' * ARGS.block_size
-
-        if hashlib.sha256(block[:-32]).digest() != block[-32:]:
-            if block != b'\0' * len(block):
-                log('not a zero filled block')
-                os._exit(1)
-
-        return block[:ARGS.block_size]
+blob_io_lock = threading.Lock()
 
 
 def server(sock, batch, batch_lock):
     conn, peer = sock.accept()
     log('client connection accepted')
+
+    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
+                 os.O_CREAT | os.O_RDONLY)
+
+    zerobuf = b'\x00' * 32
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -211,20 +199,32 @@ def server(sock, batch, batch_lock):
 
                 with batch_lock:
                     if j in batch['active']:
-                        block = batch['active'][block_offset+i]['block']
+                        block = batch['active'][j]['block']
                     elif j in batch['frozen']:
-                        block = batch['frozen'][block_offset+i]['block']
+                        block = batch['frozen'][j]['block']
 
                 if not block:
-                    block = blob_io(j*ARGS.block_size)
+                    os.lseek(fd, j*ARGS.block_size, os.SEEK_SET)
+
+                    block = os.read(fd, ARGS.block_size)
+                    chksum = os.read(fd, 32)
+
+                    if chksum != zerobuf:
+                        if hashlib.sha256(block).digest() != chksum:
+                            print(block)
+                            print(chksum)
+                            print((offset, length))
+                            log('corruption detected')
+                            os._exit(0)
 
                 blocks.append(block)
 
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
 
-            log('read offset(%d) length(%d) msec(%d)',
-                offset, length, (time.time()-ts)*1000)
+            log('read offset(%d) length(%d) msec(%d) active(%d) frozen(%d)',
+                offset, length, (time.time()-ts)*1000,
+                len(batch['active']), len(batch['frozen']))
 
         # WRITE
         elif 1 == cmd:
@@ -237,8 +237,9 @@ def server(sock, batch, batch_lock):
 
             conn.sendall(response_header)
 
-            log('write offset(%d) length(%d) msec(%d)',
-                offset, length, (time.time()-ts)*1000)
+            log('write offset(%d) length(%d) msec(%d) active(%d) frozen(%d)',
+                offset, length, (time.time()-ts)*1000,
+                len(batch['active']), len(batch['frozen']))
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
@@ -248,13 +249,19 @@ def server(sock, batch, batch_lock):
 def main():
     batch = dict(active=dict(), frozen=dict())
     batch_lock = threading.Lock()
+
+    os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
+    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
+                 os.O_CREAT | os.O_WRONLY)
+    os.lseek(fd, (ARGS.block_size+32) * ARGS.block_count, os.SEEK_SET)
+    os.write(fd, b'CBD')
+    os.close(fd)
+
     """
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
             os.environ['CBD_S3_AUTH_KEY'], os.environ['CBD_S3_AUTH_SECRET'])
     """
-
-    os.makedirs(os.path.join(ARGS.volume_dir, 'objs'), exist_ok=True)
 
     # Start the backup thread
     args = (batch, batch_lock)
@@ -292,14 +299,11 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_size', type=int, default=4096,
                       help='Device Block Size')
 
-    ARGS.add_argument('--block_count', type=int, default=256*1024,
+    ARGS.add_argument('--block_count', type=int, default=250*1024*1024,
                       help='Device Block Count')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
-
-    ARGS.add_argument('--blocks_per_blob', default=10000,
-                      help='blocks per blob')
 
     ARGS = ARGS.parse_args()
 
