@@ -109,16 +109,14 @@ def backup(batch, batch_lock):
     fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
                  os.O_CREAT | os.O_WRONLY)
 
-    old_active = -1
-    old_frozen = -1
+    old_active = old_frozen = -1
+
     while True:
         # Work on the frozen batch now
         for k, v in batch['frozen'].items():
-            sha256 = hashlib.sha256(v['block']).digest()
             os.lseek(fd, k*(ARGS.block_size+32), os.SEEK_SET)
-            os.write(fd, v['block'] + sha256)
-
-        os.fsync(fd)
+            os.write(fd, v)
+            os.write(fd, hashlib.sha256(v).digest())
 
         with batch_lock:
             batch['frozen'] = batch['active']
@@ -128,8 +126,7 @@ def backup(batch, batch_lock):
             frozen = len(batch['frozen'])
 
         if old_active != active or old_frozen != frozen:
-            log('active({}) frozen({})'.format(
-                len(batch['active']), len(batch['frozen'])))
+            log(f'active({active}) frozen({frozen})')
 
             old_active, old_frozen = active, frozen
 
@@ -154,10 +151,6 @@ def recvall(conn, length):
         length -= len(octets)
 
     return b''.join(buf)
-
-
-blob_fd_cache = dict()
-blob_io_lock = threading.Lock()
 
 
 def server(sock, batch, batch_lock):
@@ -199,21 +192,21 @@ def server(sock, batch, batch_lock):
 
                 with batch_lock:
                     if j in batch['active']:
-                        block = batch['active'][j]['block']
+                        block = batch['active'][j]
                     elif j in batch['frozen']:
-                        block = batch['frozen'][j]['block']
+                        block = batch['frozen'][j]
 
                 if not block:
-                    os.lseek(fd, j*ARGS.block_size, os.SEEK_SET)
+                    os.lseek(fd, j*(ARGS.block_size+32), os.SEEK_SET)
 
                     block = os.read(fd, ARGS.block_size)
                     chksum = os.read(fd, 32)
 
                     if chksum != zerobuf:
                         if hashlib.sha256(block).digest() != chksum:
-                            print(block)
-                            print(chksum)
-                            print((offset, length))
+                            log(block)
+                            log(chksum)
+                            log((offset, length))
                             log('corruption detected')
                             os._exit(0)
 
@@ -222,9 +215,8 @@ def server(sock, batch, batch_lock):
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
 
-            log('read offset(%d) length(%d) msec(%d) active(%d) frozen(%d)',
-                offset, length, (time.time()-ts)*1000,
-                len(batch['active']), len(batch['frozen']))
+            log('read offset(%d) length(%d) msec(%d)',
+                offset, length, (time.time()-ts)*1000)
 
         # WRITE
         elif 1 == cmd:
@@ -233,13 +225,12 @@ def server(sock, batch, batch_lock):
             with batch_lock:
                 for i in range(block_count):
                     block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                    batch['active'][block_offset+i] = dict(block=block)
+                    batch['active'][block_offset+i] = block
 
             conn.sendall(response_header)
 
-            log('write offset(%d) length(%d) msec(%d) active(%d) frozen(%d)',
-                offset, length, (time.time()-ts)*1000,
-                len(batch['active']), len(batch['frozen']))
+            log('write offset(%d) length(%d) msec(%d)',
+                offset, length, (time.time()-ts)*1000)
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
@@ -299,7 +290,7 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_size', type=int, default=4096,
                       help='Device Block Size')
 
-    ARGS.add_argument('--block_count', type=int, default=250*1024*1024,
+    ARGS.add_argument('--block_count', type=int, default=1024*1024*1024,
                       help='Device Block Count')
 
     ARGS.add_argument('--volume_dir', default='volume',
