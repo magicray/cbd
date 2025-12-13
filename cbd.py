@@ -115,8 +115,8 @@ def backup(batch, batch_lock):
         # Work on the frozen batch now
         for k, v in batch['frozen'].items():
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
-            os.write(fd, v)
             os.write(fd, struct.pack('!Q', k))
+            os.write(fd, v)
             os.write(fd, hashlib.sha256(v).digest())
 
         with batch_lock:
@@ -200,12 +200,12 @@ def server(sock, batch, batch_lock):
                 if not block:
                     os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
 
+                    num = struct.unpack('!Q', os.read(fd, 8))[0]
                     block = os.read(fd, ARGS.block_size)
-                    blknum = struct.unpack('!Q', os.read(fd, 8))[0]
                     chksum = os.read(fd, 32)
 
-                    if blknum not in (0, j):
-                        log((blknum, j))
+                    if num not in (0, j):
+                        log((num, j))
                         log('corruption detected')
                         os._exit(0)
 
@@ -297,7 +297,7 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_size', type=int, default=4096,
                       help='Device Block Size')
 
-    ARGS.add_argument('--block_count', type=int, default=1024*1024*1024,
+    ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
     ARGS.add_argument('--volume_dir', default='volume',
