@@ -236,6 +236,10 @@ def server(sock, batch, batch_lock):
         elif 1 == cmd:
             octets = recvall(conn, length)
 
+            if len(batch['active']) > ARGS.max_active_block_count:
+                log('waiting for flushing the data to object store')
+                time.sleep(1)
+
             with batch_lock:
                 for i in range(block_count):
                     block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
@@ -306,6 +310,9 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
+
+    ARGS.add_argument('--max_active_block_count', type=int, default=25000,
+                      help='Maximum active blocks, for rate limiting')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
