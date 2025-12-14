@@ -1,5 +1,6 @@
 import os
 import time
+import gzip
 import uuid
 import boto3
 import fcntl
@@ -112,12 +113,20 @@ def backup(batch, batch_lock):
     old_active = old_frozen = -1
 
     while True:
+        logbytes = list()
+
         # Work on the frozen batch now
         for k, v in batch['frozen'].items():
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
-            os.write(fd, struct.pack('!Q', k))
-            os.write(fd, v)
-            os.write(fd, hashlib.sha256(v).digest())
+
+            logbytes.append(struct.pack('!Q', k))
+            os.write(fd, logbytes[-1])
+
+            logbytes.append(v)
+            os.write(fd, logbytes[-1])
+
+            logbytes.append(hashlib.sha256(v).digest())
+            os.write(fd, logbytes[-1])
 
         with batch_lock:
             batch['frozen'] = batch['active']
@@ -126,17 +135,14 @@ def backup(batch, batch_lock):
             active = len(batch['active'])
             frozen = len(batch['frozen'])
 
+        logbytes = gzip.compress(b''.join(logbytes))
+
         if old_active != active or old_frozen != frozen:
-            log(f'active({active}) frozen({frozen})')
+            log(f'logbytes({len(logbytes)}) active({active}) frozen({frozen})')
 
             old_active, old_frozen = active, frozen
 
         time.sleep(1)
-
-    while True:
-        # Upload the octets to log and log_index to details.json
-        # s3.create('logs/{}'.format(1), body)
-        pass
 
 
 def recvall(conn, length):
@@ -211,9 +217,10 @@ def server(sock, batch, batch_lock):
 
                     if chksum != zerobuf:
                         if hashlib.sha256(block).digest() != chksum:
+                            log(num)
                             log(block)
                             log(chksum)
-                            log((offset, length))
+                            log((j, offset, length))
                             log('corruption detected')
                             os._exit(0)
 
@@ -241,7 +248,7 @@ def server(sock, batch, batch_lock):
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
-            os._exit(0)
+            os._exit(1)
 
 
 def main():
