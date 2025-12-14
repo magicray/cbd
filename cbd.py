@@ -107,8 +107,7 @@ class S3:
 
 
 def backup(batch, batch_lock):
-    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
-                 os.O_CREAT | os.O_WRONLY)
+    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.new'), os.O_WRONLY)
 
     old_active = old_frozen = -1
 
@@ -164,8 +163,8 @@ def server(sock, batch, batch_lock):
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
-                 os.O_CREAT | os.O_RDONLY)
+    fd_new = os.open(os.path.join(ARGS.volume_dir, 'cache.new'), os.O_RDONLY)
+    fd_old = os.open(os.path.join(ARGS.volume_dir, 'cache.old'), os.O_RDONLY)
 
     zerobuf = b'\x00' * 32
 
@@ -204,11 +203,15 @@ def server(sock, batch, batch_lock):
                         block = batch['frozen'][j]
 
                 if not block:
-                    os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                    for fd in (fd_new, fd_old):
+                        os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
 
-                    num = struct.unpack('!Q', os.read(fd, 8))[0]
-                    block = os.read(fd, ARGS.block_size)
-                    chksum = os.read(fd, 32)
+                        num = struct.unpack('!Q', os.read(fd, 8))[0]
+                        block = os.read(fd, ARGS.block_size)
+                        chksum = os.read(fd, 32)
+
+                        if chksum != zerobuf:
+                            break
 
                     if num not in (0, j):
                         log((num, j))
@@ -236,16 +239,14 @@ def server(sock, batch, batch_lock):
         elif 1 == cmd:
             octets = recvall(conn, length)
 
-            if len(batch['active']) > ARGS.max_active_block_count:
-                log('waiting for flushing the data to object store')
-                time.sleep(1)
-
             with batch_lock:
                 for i in range(block_count):
                     block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
                     batch['active'][block_offset+i] = block
 
             conn.sendall(response_header)
+
+            time.sleep(len(batch['active']) / ARGS.max_active_block_count)
 
             log('write offset(%d) length(%d) msec(%d)',
                 offset, length, (time.time()-ts)*1000)
@@ -260,11 +261,13 @@ def main():
     batch_lock = threading.Lock()
 
     os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
-    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.latest'),
-                 os.O_CREAT | os.O_WRONLY)
-    os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
-    os.write(fd, b'CBD')
-    os.close(fd)
+
+    for cache in ('cache.new', 'cache.old'):
+        fd = os.open(os.path.join(ARGS.volume_dir, cache),
+                     os.O_CREAT | os.O_WRONLY)
+        os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
+        os.write(fd, b'CBD')
+        os.close(fd)
 
     """
     s3 = S3(ARGS.prefix,
@@ -311,11 +314,14 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
-    ARGS.add_argument('--max_active_block_count', type=int, default=25000,
+    ARGS.add_argument('--max_active_block_count', type=int, default=100000,
                       help='Maximum active blocks, for rate limiting')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
+
+    ARGS.add_argument('--cache_file_size', default=1024*1024*1024,
+                      help='maximum cache file size')
 
     ARGS = ARGS.parse_args()
 
