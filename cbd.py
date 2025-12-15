@@ -107,14 +107,17 @@ class S3:
 
 
 def backup(batch, batch_lock):
-    fd = os.open(os.path.join(ARGS.volume_dir, 'cache.new'), os.O_WRONLY)
-
     old_active = old_frozen = -1
 
     while True:
-        logbytes = list()
+        fd = os.open(os.path.join(ARGS.volume_dir, 'cache.active'),
+                     os.O_CREAT | os.O_WRONLY)
+        os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
+        os.write(fd, b'CBD')
 
-        # Work on the frozen batch now
+        # Write the blocks in the frozen batch to local cache
+        logbytes = list()
+        block_n = len(batch['frozen'])
         for k, v in batch['frozen'].items():
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
 
@@ -127,6 +130,11 @@ def backup(batch, batch_lock):
             logbytes.append(hashlib.sha256(v).digest())
             os.write(fd, logbytes[-1])
 
+        os.close(fd)
+
+        # We are done with the frozen batch. Discard it now.
+        # Mark the current active batch as frozen and create a new
+        # empty active batch
         with batch_lock:
             batch['frozen'] = batch['active']
             batch['active'] = dict()
@@ -134,10 +142,13 @@ def backup(batch, batch_lock):
             active = len(batch['active'])
             frozen = len(batch['frozen'])
 
-        logbytes = gzip.compress(b''.join(logbytes))
+        logbytes = b''.join(logbytes)
+        byte_n = len(logbytes)
+        logbytes = gzip.compress(logbytes)
+        gzip_n = len(logbytes)
 
         if old_active != active or old_frozen != frozen:
-            log(f'logbytes({len(logbytes)}) active({active}) frozen({frozen})')
+            log(f'blocks({block_n}) bytes({byte_n}) gzip({gzip_n})')
 
             old_active, old_frozen = active, frozen
 
@@ -163,10 +174,11 @@ def server(sock, batch, batch_lock):
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    fd_new = os.open(os.path.join(ARGS.volume_dir, 'cache.new'), os.O_RDONLY)
-    fd_old = os.open(os.path.join(ARGS.volume_dir, 'cache.old'), os.O_RDONLY)
-
     zerobuf = b'\x00' * 32
+    active_fd = frozen_fd = None
+
+    active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
+    frozen_cache = os.path.join(ARGS.volume_dir, 'cache.frozen')
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -188,6 +200,19 @@ def server(sock, batch, batch_lock):
         block_count = length // ARGS.block_size
         block_offset = offset // ARGS.block_size
 
+        if active_fd:
+            file_size = os.fstat(active_fd).st_blocks * 512
+            if file_size > ARGS.cache_file_size:
+                if frozen_fd is None:
+                    os.close(active_fd)
+                    active_fd = None
+
+                    os.rename(active_cache, frozen_cache)
+                    frozen_fd = os.open(frozen_cache, os.O_RDONLY)
+
+        if active_fd is None and os.path.isfile(active_cache):
+            active_fd = os.open(active_cache, os.O_RDONLY)
+
         # READ
         if 0 == cmd:
             blocks = list()
@@ -203,15 +228,16 @@ def server(sock, batch, batch_lock):
                         block = batch['frozen'][j]
 
                 if not block:
-                    for fd in (fd_new, fd_old):
-                        os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                    for fd in (active_fd, frozen_fd):
+                        if fd is not None:
+                            os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
 
-                        num = struct.unpack('!Q', os.read(fd, 8))[0]
-                        block = os.read(fd, ARGS.block_size)
-                        chksum = os.read(fd, 32)
+                            num = struct.unpack('!Q', os.read(fd, 8))[0]
+                            block = os.read(fd, ARGS.block_size)
+                            chksum = os.read(fd, 32)
 
-                        if chksum != zerobuf:
-                            break
+                            if chksum != zerobuf:
+                                break
 
                     if num not in (0, j):
                         log((num, j))
@@ -261,14 +287,6 @@ def main():
     batch_lock = threading.Lock()
 
     os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
-
-    for cache in ('cache.new', 'cache.old'):
-        fd = os.open(os.path.join(ARGS.volume_dir, cache),
-                     os.O_CREAT | os.O_WRONLY)
-        os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
-        os.write(fd, b'CBD')
-        os.close(fd)
-
     """
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
@@ -320,7 +338,7 @@ if __name__ == '__main__':
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
 
-    ARGS.add_argument('--cache_file_size', default=1024*1024*1024,
+    ARGS.add_argument('--cache_file_size', default=256*1024*1024,
                       help='maximum cache file size')
 
     ARGS = ARGS.parse_args()
