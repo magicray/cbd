@@ -107,28 +107,40 @@ class S3:
 
 
 def backup(batch, batch_lock):
-    old_active = old_frozen = -1
-
     while True:
+        logbytes = list()
+        with batch_lock:
+            for k, v in batch['frozen'].items():
+                logbytes.append(struct.pack('!Q', k))
+                logbytes.append(v)
+                logbytes.append(hashlib.sha256(v).digest())
+
+        block_count = len(logbytes) // 3
+        logbytes = b''.join(logbytes)
+        compressed = gzip.compress(logbytes)
+
+        if logbytes:
+            with open(os.path.join(ARGS.volume_dir, 'tmp'), 'wb') as fd:
+                fd.write(compressed)
+
+            os.rename(os.path.join(ARGS.volume_dir, 'tmp'),
+                      os.path.join(ARGS.volume_dir, 'txn'))
+
+        # Write the blocks in the frozen batch to local cache
         fd = os.open(os.path.join(ARGS.volume_dir, 'cache.active'),
                      os.O_CREAT | os.O_WRONLY)
         os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
         os.write(fd, b'CBD')
 
-        # Write the blocks in the frozen batch to local cache
-        logbytes = list()
-        block_n = len(batch['frozen'])
-        for k, v in batch['frozen'].items():
+        i = 0
+        while i < len(logbytes):
+            buf = logbytes[i:i+ARGS.block_size+40]
+
+            k = struct.unpack('!Q', buf[:8])[0]
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
+            os.write(fd, buf)
 
-            logbytes.append(struct.pack('!Q', k))
-            os.write(fd, logbytes[-1])
-
-            logbytes.append(v)
-            os.write(fd, logbytes[-1])
-
-            logbytes.append(hashlib.sha256(v).digest())
-            os.write(fd, logbytes[-1])
+            i += ARGS.block_size + 40
 
         os.close(fd)
 
@@ -139,18 +151,9 @@ def backup(batch, batch_lock):
             batch['frozen'] = batch['active']
             batch['active'] = dict()
 
-            active = len(batch['active'])
-            frozen = len(batch['frozen'])
-
-        logbytes = b''.join(logbytes)
-        byte_n = len(logbytes)
-        logbytes = gzip.compress(logbytes)
-        gzip_n = len(logbytes)
-
-        if old_active != active or old_frozen != frozen:
-            log(f'blocks({block_n}) bytes({byte_n}) gzip({gzip_n})')
-
-            old_active, old_frozen = active, frozen
+        if logbytes:
+            log('blocks({}) bytes({}) compressed({})'.format(
+                block_count, len(logbytes), len(compressed)))
 
         time.sleep(1)
 
@@ -175,10 +178,24 @@ def server(sock, batch, batch_lock):
     log('client connection accepted')
 
     zerobuf = b'\x00' * 32
-    active_fd = frozen_fd = None
 
+    active_fd = frozen_fd = None
     active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
     frozen_cache = os.path.join(ARGS.volume_dir, 'cache.frozen')
+
+    with batch_lock:
+        txn = os.path.join(ARGS.volume_dir, 'txn')
+        if os.path.isfile(txn):
+            with open(txn, 'rb') as fd:
+                octets = gzip.decompress(fd.read())
+
+            i = 0
+            while i < len(octets):
+                buf = octets[i:i+ARGS.block_size+40]
+                num = struct.unpack('!Q', buf[:8])[0]
+                batch['active'][num] = buf[8:-32]
+
+                i += ARGS.block_size+40
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -201,17 +218,17 @@ def server(sock, batch, batch_lock):
         block_offset = offset // ARGS.block_size
 
         if active_fd:
-            file_size = os.fstat(active_fd).st_blocks * 512
-            if file_size > ARGS.cache_file_size:
+            if os.fstat(active_fd).st_blocks * 512 > ARGS.cache_file_size:
                 if frozen_fd is None:
-                    os.close(active_fd)
-                    active_fd = None
-
                     os.rename(active_cache, frozen_cache)
-                    frozen_fd = os.open(frozen_cache, os.O_RDONLY)
+                    frozen_fd = active_fd
+                    active_fd = None
 
         if active_fd is None and os.path.isfile(active_cache):
             active_fd = os.open(active_cache, os.O_RDONLY)
+
+        if frozen_fd is None and os.path.isfile(frozen_cache):
+            frozen_fd = os.open(frozen_cache, os.O_RDONLY)
 
         # READ
         if 0 == cmd:
@@ -272,7 +289,8 @@ def server(sock, batch, batch_lock):
 
             conn.sendall(response_header)
 
-            time.sleep(len(batch['active']) / ARGS.max_active_block_count)
+            if len(batch['active']) > ARGS.max_active_block_count:
+                time.sleep(0.1)
 
             log('write offset(%d) length(%d) msec(%d)',
                 offset, length, (time.time()-ts)*1000)
@@ -332,13 +350,13 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
-    ARGS.add_argument('--max_active_block_count', type=int, default=100000,
+    ARGS.add_argument('--max_active_block_count', type=int, default=10000,
                       help='Maximum active blocks, for rate limiting')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
 
-    ARGS.add_argument('--cache_file_size', default=256*1024*1024,
+    ARGS.add_argument('--cache_file_size', default=1024*1024*1024,
                       help='maximum cache file size')
 
     ARGS = ARGS.parse_args()
