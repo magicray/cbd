@@ -109,13 +109,12 @@ class S3:
 def backup(batch, batch_lock):
     while True:
         logbytes = list()
-        with batch_lock:
-            for k, v in batch['frozen'].items():
-                logbytes.append(struct.pack('!Q', k))
-                logbytes.append(v)
-                logbytes.append(hashlib.sha256(v).digest())
+        for k, v in batch['frozen'].items():
+            logbytes.append(v['num'])
+            logbytes.append(v['block'])
+            logbytes.append(v['chksum'])
 
-        block_count = len(logbytes) // 3
+        block_count = len(batch['frozen'])
         logbytes = b''.join(logbytes)
         compressed = gzip.compress(logbytes)
 
@@ -132,15 +131,11 @@ def backup(batch, batch_lock):
         os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
         os.write(fd, b'CBD')
 
-        i = 0
-        while i < len(logbytes):
-            buf = logbytes[i:i+ARGS.block_size+40]
-
-            k = struct.unpack('!Q', buf[:8])[0]
+        for k, v in batch['frozen'].items():
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
-            os.write(fd, buf)
-
-            i += ARGS.block_size + 40
+            os.write(fd, v['num'])
+            os.write(fd, v['block'])
+            os.write(fd, v['chksum'])
 
         os.close(fd)
 
@@ -155,7 +150,7 @@ def backup(batch, batch_lock):
             log('blocks({}) bytes({}) compressed({})'.format(
                 block_count, len(logbytes), len(compressed)))
 
-        time.sleep(1)
+        time.sleep(ARGS.sync_interval)
 
 
 def recvall(conn, length):
@@ -193,7 +188,10 @@ def server(sock, batch, batch_lock):
             while i < len(octets):
                 buf = octets[i:i+ARGS.block_size+40]
                 num = struct.unpack('!Q', buf[:8])[0]
-                batch['active'][num] = buf[8:-32]
+                batch['active'][num] = dict(
+                    num=buf[:8],
+                    block=buf[8:-32],
+                    chksum=buf[-32:])
 
                 i += ARGS.block_size+40
 
@@ -218,7 +216,8 @@ def server(sock, batch, batch_lock):
         block_offset = offset // ARGS.block_size
 
         if active_fd:
-            if os.fstat(active_fd).st_blocks * 512 > ARGS.cache_file_size:
+            file_size = os.fstat(active_fd).st_blocks * 512
+            if file_size > (ARGS.cache_block_count * ARGS.block_size) / 2:
                 if frozen_fd is None:
                     os.rename(active_cache, frozen_cache)
                     frozen_fd = active_fd
@@ -240,9 +239,9 @@ def server(sock, batch, batch_lock):
 
                 with batch_lock:
                     if j in batch['active']:
-                        block = batch['active'][j]
+                        block = batch['active'][j]['block']
                     elif j in batch['frozen']:
-                        block = batch['frozen'][j]
+                        block = batch['frozen'][j]['block']
 
                 if not block:
                     for fd in (active_fd, frozen_fd):
@@ -285,12 +284,14 @@ def server(sock, batch, batch_lock):
             with batch_lock:
                 for i in range(block_count):
                     block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                    batch['active'][block_offset+i] = block
+                    batch['active'][block_offset+i] = dict(
+                        num=struct.pack('!Q', block_offset+i),
+                        block=block,
+                        chksum=hashlib.sha256(block).digest())
 
             conn.sendall(response_header)
 
-            if len(batch['active']) > ARGS.max_active_block_count:
-                time.sleep(0.1)
+            time.sleep(len(batch['active'])/ARGS.pending_block_count)
 
             log('write offset(%d) length(%d) msec(%d)',
                 offset, length, (time.time()-ts)*1000)
@@ -350,14 +351,17 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
-    ARGS.add_argument('--max_active_block_count', type=int, default=10000,
-                      help='Maximum active blocks, for rate limiting')
+    ARGS.add_argument('--pending_block_count', type=int, default=100000,
+                      help='Maximum pending blocks, for rate limiting')
+
+    ARGS.add_argument('--cache_block_count', type=int, default=512*1024,
+                      help='maximum cacheed blocks')
+
+    ARGS.add_argument('--sync_interval', type=int, default=1,
+                      help='interval between writes to object store')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
-
-    ARGS.add_argument('--cache_file_size', default=1024*1024*1024,
-                      help='maximum cache file size')
 
     ARGS = ARGS.parse_args()
 
