@@ -150,7 +150,7 @@ def backup(batch, batch_lock):
             log('blocks({}) bytes({}) compressed({})'.format(
                 block_count, len(logbytes), len(compressed)))
 
-        time.sleep(ARGS.sync_interval)
+        time.sleep(1)
 
 
 def recvall(conn, length):
@@ -274,8 +274,8 @@ def server(sock, batch, batch_lock):
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
 
-            log('read offset(%d) length(%d) msec(%d)',
-                offset, length, (time.time()-ts)*1000)
+            log('read block(%d) count(%d) msec(%d)',
+                block_offset, block_count, (time.time()-ts)*1000)
 
         # WRITE
         elif 1 == cmd:
@@ -291,10 +291,10 @@ def server(sock, batch, batch_lock):
 
             conn.sendall(response_header)
 
-            time.sleep(len(batch['active'])/ARGS.pending_block_count)
+            time.sleep((block_count*ARGS.write_delay_usec)/1000000)
 
-            log('write offset(%d) length(%d) msec(%d)',
-                offset, length, (time.time()-ts)*1000)
+            log('write block(%d) count(%d) msec(%d)',
+                block_offset, block_count, (time.time()-ts)*1000)
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
@@ -351,14 +351,14 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
-    ARGS.add_argument('--pending_block_count', type=int, default=100000,
+    ARGS.add_argument('--max_pending_block_count', type=int, default=100000,
                       help='Maximum pending blocks, for rate limiting')
 
     ARGS.add_argument('--cache_block_count', type=int, default=512*1024,
                       help='maximum cacheed blocks')
 
-    ARGS.add_argument('--sync_interval', type=int, default=1,
-                      help='interval between writes to object store')
+    ARGS.add_argument('--write_delay_usec', type=int, default=1000,
+                      help='write delay per block')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
