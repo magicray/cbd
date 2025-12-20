@@ -243,7 +243,7 @@ def server(sock):
                 logfile = os.path.join(logdir, str(int(time.time()*1000000)))
 
                 logbytes = b''.join(logs.values())
-                compressed = gzip.compress(logbytes)
+                compressed = gzip.compress(logbytes, compresslevel=1)
                 with open(logfile, 'wb') as fd:
                     fd.write(compressed)
 
