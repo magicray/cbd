@@ -160,7 +160,7 @@ def backup():
             log('blocks({}) bytes({}) compressed({})'.format(
                 block_count, len(logbytes), len(compressed)))
 
-            G.max_pending_block_count = 2 * block_count / (time.time() - ts)
+            G.max_pending_block_count = 10 * block_count / (time.time() - ts)
 
             ts = time.time()
 
@@ -308,8 +308,8 @@ def server(sock):
             if len(G.active_batch) > G.max_pending_block_count:
                 time.sleep(1)
 
-            #log('write block(%d) count(%d) msec(%d)',
-            #    block_offset, block_count, (time.time()-ts)*1000)
+            log('write block(%d) count(%d) msec(%d)',
+                block_offset, block_count, (time.time()-ts)*1000)
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
