@@ -13,14 +13,6 @@ import threading
 from logging import critical as log
 
 
-class G:
-    batch_lock = threading.Lock()
-    active_batch = dict()
-    frozen_batch = dict()
-
-    max_pending_block_count = 1
-
-
 def device_init(dev, block_size, block_count, conn):
     # Value = (0xab << 8) + n
     # Network Block Device ioctl commands
@@ -115,55 +107,7 @@ class S3:
 
 
 def backup():
-    ts = time.time()
-
     while True:
-        logbytes = list()
-        for k, v in G.frozen_batch.items():
-            logbytes.append(v['num'])
-            logbytes.append(v['block'])
-            logbytes.append(v['chksum'])
-
-        block_count = len(G.frozen_batch)
-        logbytes = b''.join(logbytes)
-        compressed = gzip.compress(logbytes)
-
-        if logbytes:
-            with open(os.path.join(ARGS.volume_dir, 'tmp'), 'wb') as fd:
-                fd.write(compressed)
-
-            os.rename(os.path.join(ARGS.volume_dir, 'tmp'),
-                      os.path.join(ARGS.volume_dir, 'txn'))
-
-        # Write the blocks in the frozen batch to local cache
-        fd = os.open(os.path.join(ARGS.volume_dir, 'cache.active'),
-                     os.O_CREAT | os.O_WRONLY)
-        os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
-        os.write(fd, b'CBD')
-
-        for k, v in G.frozen_batch.items():
-            os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
-            os.write(fd, v['num'])
-            os.write(fd, v['block'])
-            os.write(fd, v['chksum'])
-
-        os.close(fd)
-
-        # We are done with the frozen batch. Discard it now.
-        # Mark the current active batch as frozen and create a new
-        # empty active batch
-        with G.batch_lock:
-            G.frozen_batch = G.active_batch
-            G.active_batch = dict()
-
-        if logbytes:
-            log('blocks({}) bytes({}) compressed({})'.format(
-                block_count, len(logbytes), len(compressed)))
-
-            G.max_pending_block_count = 10 * block_count / (time.time() - ts)
-
-            ts = time.time()
-
         time.sleep(1)
 
 
@@ -188,26 +132,13 @@ def server(sock):
 
     zerobuf = b'\x00' * 32
 
+    logs = dict()
+    logts = time.time()
+    logdir = os.path.join(ARGS.volume_dir, 'logs')
+
     active_fd = frozen_fd = None
     active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
     frozen_cache = os.path.join(ARGS.volume_dir, 'cache.frozen')
-
-    with G.batch_lock:
-        txn = os.path.join(ARGS.volume_dir, 'txn')
-        if os.path.isfile(txn):
-            with open(txn, 'rb') as fd:
-                octets = gzip.decompress(fd.read())
-
-            i = 0
-            while i < len(octets):
-                buf = octets[i:i+ARGS.block_size+40]
-                num = struct.unpack('!Q', buf[:8])[0]
-                G.active_batch[num] = dict(
-                    num=buf[:8],
-                    block=buf[8:-32],
-                    chksum=buf[-32:])
-
-                i += ARGS.block_size+40
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -229,7 +160,7 @@ def server(sock):
         block_count = length // ARGS.block_size
         block_offset = offset // ARGS.block_size
 
-        if active_fd:
+        if active_fd and os.path.isfile(active_cache):
             file_size = os.fstat(active_fd).st_blocks * 512
             if file_size > (ARGS.cache_block_count * ARGS.block_size) / 2:
                 if frozen_fd is None:
@@ -237,8 +168,11 @@ def server(sock):
                     frozen_fd = active_fd
                     active_fd = None
 
-        if active_fd is None and os.path.isfile(active_cache):
-            active_fd = os.open(active_cache, os.O_RDONLY)
+        if active_fd is None:
+            active_fd = os.open(active_cache, os.O_CREAT | os.O_RDWR)
+            cache_file_size = (ARGS.block_size+40) * ARGS.block_count
+            os.lseek(active_fd, cache_file_size, os.SEEK_SET)
+            os.write(active_fd, b'CBD')
 
         if frozen_fd is None and os.path.isfile(frozen_cache):
             frozen_fd = os.open(frozen_cache, os.O_RDONLY)
@@ -249,39 +183,35 @@ def server(sock):
 
             for i in range(block_count):
                 j = block_offset + i
+
+                num = 0
                 block = b''
+                chksum = b''
 
-                with G.batch_lock:
-                    if j in G.active_batch:
-                        block = G.active_batch[j]['block']
-                    elif j in G.frozen_batch:
-                        block = G.frozen_batch[j]['block']
+                for fd in (active_fd, frozen_fd):
+                    if fd is not None:
+                        os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
 
-                if not block:
-                    for fd in (active_fd, frozen_fd):
-                        if fd is not None:
-                            os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                        num = struct.unpack('!Q', os.read(fd, 8))[0]
+                        block = os.read(fd, ARGS.block_size)
+                        chksum = os.read(fd, 32)
 
-                            num = struct.unpack('!Q', os.read(fd, 8))[0]
-                            block = os.read(fd, ARGS.block_size)
-                            chksum = os.read(fd, 32)
+                        if chksum != zerobuf:
+                            break
 
-                            if chksum != zerobuf:
-                                break
+                if num not in (0, j):
+                    log((num, j))
+                    log('corruption detected')
+                    os._exit(0)
 
-                    if num not in (0, j):
-                        log((num, j))
+                if chksum != zerobuf:
+                    if hashlib.sha256(block).digest() != chksum:
+                        log(num)
+                        log(block)
+                        log(chksum)
+                        log((j, offset, length))
                         log('corruption detected')
                         os._exit(0)
-
-                    if chksum != zerobuf:
-                        if hashlib.sha256(block).digest() != chksum:
-                            log(num)
-                            log(block)
-                            log(chksum)
-                            log((j, offset, length))
-                            log('corruption detected')
-                            os._exit(0)
 
                 blocks.append(block)
 
@@ -295,18 +225,33 @@ def server(sock):
         elif 1 == cmd:
             octets = recvall(conn, length)
 
-            with G.batch_lock:
-                for i in range(block_count):
-                    block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                    G.active_batch[block_offset+i] = dict(
-                        num=struct.pack('!Q', block_offset+i),
-                        block=block,
-                        chksum=hashlib.sha256(block).digest())
+            for i in range(block_count):
+                block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
+
+                num = struct.pack('!Q', block_offset+i)
+                chksum = hashlib.sha256(block).digest()
+
+                logs[block_offset+i] = b''.join([num, block, chksum])
+
+                os.lseek(active_fd, (block_offset+i)*(ARGS.block_size+40),
+                         os.SEEK_SET)
+                os.write(active_fd, logs[block_offset+i])
 
             conn.sendall(response_header)
 
-            if len(G.active_batch) > G.max_pending_block_count:
-                time.sleep(1)
+            if time.time() - logts > 0.1:
+                logfile = os.path.join(logdir, str(int(time.time()*1000000)))
+
+                logbytes = b''.join(logs.values())
+                compressed = gzip.compress(logbytes)
+                with open(logfile, 'wb') as fd:
+                    fd.write(compressed)
+
+                log('blocks({}) bytes({}) compressed({})'.format(
+                    len(logs), len(logbytes), len(compressed)))
+
+                logs = dict()
+                logts = time.time()
 
             log('write block(%d) count(%d) msec(%d)',
                 block_offset, block_count, (time.time()-ts)*1000)
@@ -317,7 +262,7 @@ def server(sock):
 
 
 def main():
-    os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
+    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
     """
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
