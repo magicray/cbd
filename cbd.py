@@ -13,6 +13,14 @@ import threading
 from logging import critical as log
 
 
+class G:
+    batch_lock = threading.Lock()
+    active_batch = dict()
+    frozen_batch = dict()
+
+    max_pending_block_count = 1
+
+
 def device_init(dev, block_size, block_count, conn):
     # Value = (0xab << 8) + n
     # Network Block Device ioctl commands
@@ -106,15 +114,17 @@ class S3:
         return octets if octets else None
 
 
-def backup(batch, batch_lock):
+def backup():
+    ts = time.time()
+
     while True:
         logbytes = list()
-        for k, v in batch['frozen'].items():
+        for k, v in G.frozen_batch.items():
             logbytes.append(v['num'])
             logbytes.append(v['block'])
             logbytes.append(v['chksum'])
 
-        block_count = len(batch['frozen'])
+        block_count = len(G.frozen_batch)
         logbytes = b''.join(logbytes)
         compressed = gzip.compress(logbytes)
 
@@ -131,7 +141,7 @@ def backup(batch, batch_lock):
         os.lseek(fd, (ARGS.block_size+40) * ARGS.block_count, os.SEEK_SET)
         os.write(fd, b'CBD')
 
-        for k, v in batch['frozen'].items():
+        for k, v in G.frozen_batch.items():
             os.lseek(fd, k*(ARGS.block_size+40), os.SEEK_SET)
             os.write(fd, v['num'])
             os.write(fd, v['block'])
@@ -142,13 +152,17 @@ def backup(batch, batch_lock):
         # We are done with the frozen batch. Discard it now.
         # Mark the current active batch as frozen and create a new
         # empty active batch
-        with batch_lock:
-            batch['frozen'] = batch['active']
-            batch['active'] = dict()
+        with G.batch_lock:
+            G.frozen_batch = G.active_batch
+            G.active_batch = dict()
 
         if logbytes:
             log('blocks({}) bytes({}) compressed({})'.format(
                 block_count, len(logbytes), len(compressed)))
+
+            G.max_pending_block_count = 2 * block_count / (time.time() - ts)
+
+            ts = time.time()
 
         time.sleep(1)
 
@@ -168,7 +182,7 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
-def server(sock, batch, batch_lock):
+def server(sock):
     conn, peer = sock.accept()
     log('client connection accepted')
 
@@ -178,7 +192,7 @@ def server(sock, batch, batch_lock):
     active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
     frozen_cache = os.path.join(ARGS.volume_dir, 'cache.frozen')
 
-    with batch_lock:
+    with G.batch_lock:
         txn = os.path.join(ARGS.volume_dir, 'txn')
         if os.path.isfile(txn):
             with open(txn, 'rb') as fd:
@@ -188,7 +202,7 @@ def server(sock, batch, batch_lock):
             while i < len(octets):
                 buf = octets[i:i+ARGS.block_size+40]
                 num = struct.unpack('!Q', buf[:8])[0]
-                batch['active'][num] = dict(
+                G.active_batch[num] = dict(
                     num=buf[:8],
                     block=buf[8:-32],
                     chksum=buf[-32:])
@@ -237,11 +251,11 @@ def server(sock, batch, batch_lock):
                 j = block_offset + i
                 block = b''
 
-                with batch_lock:
-                    if j in batch['active']:
-                        block = batch['active'][j]['block']
-                    elif j in batch['frozen']:
-                        block = batch['frozen'][j]['block']
+                with G.batch_lock:
+                    if j in G.active_batch:
+                        block = G.active_batch[j]['block']
+                    elif j in G.frozen_batch:
+                        block = G.frozen_batch[j]['block']
 
                 if not block:
                     for fd in (active_fd, frozen_fd):
@@ -281,20 +295,21 @@ def server(sock, batch, batch_lock):
         elif 1 == cmd:
             octets = recvall(conn, length)
 
-            with batch_lock:
+            with G.batch_lock:
                 for i in range(block_count):
                     block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
-                    batch['active'][block_offset+i] = dict(
+                    G.active_batch[block_offset+i] = dict(
                         num=struct.pack('!Q', block_offset+i),
                         block=block,
                         chksum=hashlib.sha256(block).digest())
 
             conn.sendall(response_header)
 
-            time.sleep((block_count*ARGS.write_delay_usec)/1000000)
+            if len(G.active_batch) > G.max_pending_block_count:
+                time.sleep(1)
 
-            log('write block(%d) count(%d) msec(%d)',
-                block_offset, block_count, (time.time()-ts)*1000)
+            #log('write block(%d) count(%d) msec(%d)',
+            #    block_offset, block_count, (time.time()-ts)*1000)
         else:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
@@ -302,9 +317,6 @@ def server(sock, batch, batch_lock):
 
 
 def main():
-    batch = dict(active=dict(), frozen=dict())
-    batch_lock = threading.Lock()
-
     os.makedirs(os.path.join(ARGS.volume_dir), exist_ok=True)
     """
     s3 = S3(ARGS.prefix,
@@ -313,8 +325,7 @@ def main():
     """
 
     # Start the backup thread
-    args = (batch, batch_lock)
-    threading.Thread(target=backup, args=args).start()
+    threading.Thread(target=backup).start()
 
     # Initialize the unix domain server socket
     sock_path = os.path.join('/tmp', str(uuid.uuid4()))
@@ -324,7 +335,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, batch, batch_lock)
+    args = (server_sock,)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
@@ -351,14 +362,8 @@ if __name__ == '__main__':
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
 
-    ARGS.add_argument('--max_pending_block_count', type=int, default=100000,
-                      help='Maximum pending blocks, for rate limiting')
-
     ARGS.add_argument('--cache_block_count', type=int, default=512*1024,
                       help='maximum cacheed blocks')
-
-    ARGS.add_argument('--write_delay_usec', type=int, default=1000,
-                      help='write delay per block')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
