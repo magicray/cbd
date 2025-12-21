@@ -135,6 +135,8 @@ def server(sock):
     logs = dict()
     logts = time.time()
     logdir = os.path.join(ARGS.volume_dir, 'logs')
+    logfiles = [int(f) for f in os.listdir(logdir)]
+    log_seq_num = max(logfiles) if logfiles else 0
 
     active_fd = frozen_fd = None
     active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
@@ -240,15 +242,21 @@ def server(sock):
             conn.sendall(response_header)
 
             if time.time() - logts > 0.1:
-                logfile = os.path.join(logdir, str(int(time.time()*1000000)))
-
                 logbytes = b''.join(logs.values())
                 compressed = gzip.compress(logbytes, compresslevel=1)
-                with open(logfile, 'wb') as fd:
-                    fd.write(compressed)
 
-                log('blocks({}) bytes({}) compressed({})'.format(
-                    len(logs), len(logbytes), len(compressed)))
+                log_seq_num += 1
+
+                tmpfile = os.path.join(logdir, uuid.uuid4().hex)
+                logfile = os.path.join(logdir, str(log_seq_num))
+                with open(tmpfile, 'wb') as fd:
+                    fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
+                    fd.write(compressed)
+                    fd.write(hashlib.sha256(compressed).digest())
+                os.rename(tmpfile, logfile)
+
+                log('lsn({}) blocks({}) bytes({}) compressed({})'.format(
+                    log_seq_num, len(logs), len(logbytes), len(compressed)))
 
                 logs = dict()
                 logts = time.time()
