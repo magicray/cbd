@@ -186,10 +186,7 @@ def server(sock):
             for i in range(block_count):
                 j = block_offset + i
 
-                num = 0
-                block = b''
-                chksum = b''
-
+                num = block = chksum = b''
                 for fd in (active_fd, frozen_fd):
                     if fd is not None:
                         os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
@@ -202,17 +199,13 @@ def server(sock):
                             break
 
                 if num not in (0, j):
-                    log((num, j))
-                    log('corruption detected')
+                    log(('corrupt block', j, num))
                     os._exit(0)
 
                 if chksum != zerobuf:
                     if hashlib.sha256(block).digest() != chksum:
-                        log(num)
                         log(block)
-                        log(chksum)
-                        log((j, offset, length))
-                        log('corruption detected')
+                        log(('corrupt block', j, num, offset, length, chksum))
                         os._exit(0)
 
                 blocks.append(block)
@@ -228,38 +221,18 @@ def server(sock):
             octets = recvall(conn, length)
 
             for i in range(block_count):
+                j = block_offset + i
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
 
-                num = struct.pack('!Q', block_offset+i)
-                chksum = hashlib.sha256(block).digest()
+                logs[j] = b''.join([
+                    struct.pack('!Q', j),
+                    block,
+                    hashlib.sha256(block).digest()])
 
-                logs[block_offset+i] = b''.join([num, block, chksum])
-
-                os.lseek(active_fd, (block_offset+i)*(ARGS.block_size+40),
-                         os.SEEK_SET)
-                os.write(active_fd, logs[block_offset+i])
+                os.lseek(active_fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                os.write(active_fd, logs[j])
 
             conn.sendall(response_header)
-
-            if time.time() - logts > 0.1:
-                logbytes = b''.join(logs.values())
-                compressed = gzip.compress(logbytes, compresslevel=1)
-
-                log_seq_num += 1
-
-                tmpfile = os.path.join(logdir, uuid.uuid4().hex)
-                logfile = os.path.join(logdir, str(log_seq_num))
-                with open(tmpfile, 'wb') as fd:
-                    fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
-                    fd.write(compressed)
-                    fd.write(hashlib.sha256(compressed).digest())
-                os.rename(tmpfile, logfile)
-
-                log('lsn({}) blocks({}) bytes({}) compressed({})'.format(
-                    log_seq_num, len(logs), len(logbytes), len(compressed)))
-
-                logs = dict()
-                logts = time.time()
 
             log('write block(%d) count(%d) msec(%d)',
                 block_offset, block_count, (time.time()-ts)*1000)
@@ -267,6 +240,26 @@ def server(sock):
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
             os._exit(1)
+
+        if logs and time.time() - logts > 0.1:
+            logbytes = b''.join(logs.values())
+            compressed = gzip.compress(logbytes, compresslevel=1)
+
+            log_seq_num += 1
+
+            tmpfile = os.path.join(logdir, uuid.uuid4().hex)
+            logfile = os.path.join(logdir, str(log_seq_num))
+            with open(tmpfile, 'wb') as fd:
+                fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
+                fd.write(compressed)
+                fd.write(hashlib.sha256(compressed).digest())
+            os.rename(tmpfile, logfile)
+
+            log('lsn({}) blocks({}) bytes({}) compressed({})'.format(
+                log_seq_num, len(logs), len(logbytes), len(compressed)))
+
+            logs = dict()
+            logts = time.time()
 
 
 def main():
