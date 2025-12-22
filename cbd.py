@@ -26,7 +26,7 @@ def device_init(dev, block_size, block_count, conn):
     NBD_SET_SIZE_BLOCKS = 43783
     NBD_DISCONNECT = 43784
     NBD_SET_TIMEOUT = 43785
-    # NBD_SET_FLAGS = 43786
+    NBD_SET_FLAGS = 43786
 
     fd = os.open(dev, os.O_RDWR)
     fcntl.ioctl(fd, NBD_CLEAR_QUEUE)
@@ -37,6 +37,9 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_SET_TIMEOUT, 30)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
+
+    # set FLUSH option
+    fcntl.ioctl(fd, NBD_SET_FLAGS, 5)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
         dev, block_size, block_count)
@@ -236,12 +239,14 @@ def server(sock):
 
             log('write block(%d) count(%d) msec(%d)',
                 block_offset, block_count, (time.time()-ts)*1000)
-        else:
+
+        elif 3 != cmd:
             log('cmd(%d) offset(%d) length(%d) msec(%d)',
                 cmd, offset, length, (time.time()-ts)*1000)
             os._exit(1)
 
-        if logs and time.time() - logts > 0.1:
+        # FLUSH
+        if 3 == cmd or (logs and time.time() - logts > 1):
             logbytes = b''.join(logs.values())
             compressed = gzip.compress(logbytes, compresslevel=1)
 
@@ -255,8 +260,15 @@ def server(sock):
                 fd.write(hashlib.sha256(compressed).digest())
             os.rename(tmpfile, logfile)
 
-            log('lsn({}) blocks({}) bytes({}) compressed({})'.format(
-                log_seq_num, len(logs), len(logbytes), len(compressed)))
+            os.fsync(active_fd)
+
+            # send response to FLUSH command
+            if 3 == cmd:
+                conn.sendall(response_header)
+
+            log('flush lsn(%d) blocks(%d) bytes(%d) compressed(%d) msec(%d)',
+                log_seq_num, len(logs), len(logbytes), len(compressed),
+                (time.time()-ts)*1000)
 
             logs = dict()
             logts = time.time()
