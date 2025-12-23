@@ -135,6 +135,8 @@ def server(sock):
 
     zerobuf = b'\x00' * 32
 
+    commands = ['read', 'write', None, 'flush']
+
     logs = dict()
     logts = time.time()
     logdir = os.path.join(ARGS.volume_dir, 'logs')
@@ -216,11 +218,11 @@ def server(sock):
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
 
-            log('read block(%d) count(%d) msec(%d)',
-                block_offset, block_count, (time.time()-ts)*1000)
+            # log('read block(%d) count(%d) msec(%d)',
+            #    block_offset, block_count, (time.time()-ts)*1000)
 
         # WRITE
-        elif 1 == cmd:
+        if 1 == cmd:
             octets = recvall(conn, length)
 
             for i in range(block_count):
@@ -237,41 +239,42 @@ def server(sock):
 
             conn.sendall(response_header)
 
-            log('write block(%d) count(%d) msec(%d)',
-                block_offset, block_count, (time.time()-ts)*1000)
-
-        elif 3 != cmd:
-            log('cmd(%d) offset(%d) length(%d) msec(%d)',
-                cmd, offset, length, (time.time()-ts)*1000)
-            os._exit(1)
-
         # FLUSH
-        if 3 == cmd or (logs and time.time() - logts > 1):
-            logbytes = b''.join(logs.values())
-            compressed = gzip.compress(logbytes, compresslevel=1)
+        if 3 == cmd or time.time() - logts > 0.11:
+            if logs:
+                logbytes = b''.join(logs.values())
+                compressed = gzip.compress(logbytes, compresslevel=1)
 
-            log_seq_num += 1
+                log_seq_num += 1
 
-            tmpfile = os.path.join(logdir, uuid.uuid4().hex)
-            logfile = os.path.join(logdir, str(log_seq_num))
-            with open(tmpfile, 'wb') as fd:
-                fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
-                fd.write(compressed)
-                fd.write(hashlib.sha256(compressed).digest())
-            os.rename(tmpfile, logfile)
+                tmpfile = os.path.join(logdir, uuid.uuid4().hex)
+                logfile = os.path.join(logdir, str(log_seq_num))
+                with open(tmpfile, 'wb') as fd:
+                    fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
+                    fd.write(compressed)
+                    fd.write(hashlib.sha256(compressed).digest())
+                os.rename(tmpfile, logfile)
 
-            os.fsync(active_fd)
+                os.fsync(active_fd)
+
+                log('lsn(%d) blocks(%d) bytes(%d) compressed(%d) msec(%d)',
+                    log_seq_num, len(logs), len(logbytes), len(compressed),
+                    (time.time()-ts)*1000)
+
+                logs = dict()
 
             # send response to FLUSH command
             if 3 == cmd:
                 conn.sendall(response_header)
 
-            log('flush lsn(%d) blocks(%d) bytes(%d) compressed(%d) msec(%d)',
-                log_seq_num, len(logs), len(logbytes), len(compressed),
-                (time.time()-ts)*1000)
-
-            logs = dict()
             logts = time.time()
+
+        log('cmd(%s) offset(%d) length(%d) msec(%d)',
+            commands[cmd], offset, length, (time.time()-ts)*1000)
+
+        if cmd not in (0, 1, 3):
+            log('unsupported command')
+            os._exit(1)
 
 
 def main():
