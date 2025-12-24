@@ -137,6 +137,10 @@ def server(sock):
 
     commands = ['read', 'write', None, 'flush']
 
+    # block + lsn + usec_timestamp + sha256
+    header_size = 8 + 8 + 8 + 32
+    header_block_size = ARGS.block_size + header_size
+
     logs = dict()
     logts = time.time()
     logdir = os.path.join(ARGS.volume_dir, 'logs')
@@ -177,7 +181,7 @@ def server(sock):
 
         if active_fd is None:
             active_fd = os.open(active_cache, os.O_CREAT | os.O_RDWR)
-            cache_file_size = (ARGS.block_size+40) * ARGS.block_count
+            cache_file_size = header_block_size * ARGS.block_count
             os.lseek(active_fd, cache_file_size, os.SEEK_SET)
             os.write(active_fd, b'CBD')
 
@@ -191,14 +195,16 @@ def server(sock):
             for i in range(block_count):
                 j = block_offset + i
 
-                num = block = chksum = b''
+                num = lsn = usec = block = chksum = b''
                 for fd in (active_fd, frozen_fd):
                     if fd is not None:
-                        os.lseek(fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                        os.lseek(fd, j*header_block_size, os.SEEK_SET)
 
-                        num = struct.unpack('!Q', os.read(fd, 8))[0]
+                        hdr = os.read(fd, 24)
                         block = os.read(fd, ARGS.block_size)
                         chksum = os.read(fd, 32)
+
+                        num, lsn, usec = struct.unpack('!QQQ', hdr)
 
                         if chksum != zerobuf:
                             break
@@ -208,7 +214,9 @@ def server(sock):
                     os._exit(0)
 
                 if chksum != zerobuf:
-                    if hashlib.sha256(block).digest() != chksum:
+                    sha = hashlib.sha256(hdr)
+                    sha.update(block)
+                    if sha.digest() != chksum:
                         log(block)
                         log(('corrupt block', j, num, offset, length, chksum))
                         os._exit(0)
@@ -218,9 +226,6 @@ def server(sock):
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
 
-            # log('read block(%d) count(%d) msec(%d)',
-            #    block_offset, block_count, (time.time()-ts)*1000)
-
         # WRITE
         if 1 == cmd:
             octets = recvall(conn, length)
@@ -229,18 +234,21 @@ def server(sock):
                 j = block_offset + i
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
 
-                logs[j] = b''.join([
-                    struct.pack('!Q', j),
-                    block,
-                    hashlib.sha256(block).digest()])
+                hdr = struct.pack('!QQQ', j, log_seq_num+1,
+                                  int(time.time()*1000000))
 
-                os.lseek(active_fd, j*(ARGS.block_size+40), os.SEEK_SET)
+                sha = hashlib.sha256(hdr)
+                sha.update(block)
+
+                logs[j] = b''.join([hdr, block, sha.digest()])
+
+                os.lseek(active_fd, j*header_block_size, os.SEEK_SET)
                 os.write(active_fd, logs[j])
 
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 0.11:
+        if 3 == cmd or time.time() - logts > 0.1:
             if logs:
                 logbytes = b''.join(logs.values())
                 compressed = gzip.compress(logbytes, compresslevel=1)
