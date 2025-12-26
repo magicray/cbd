@@ -147,9 +147,10 @@ def server(sock):
     logfiles = [int(f) for f in os.listdir(logdir)]
     log_seq_num = max(logfiles) if logfiles else 0
 
-    active_fd = frozen_fd = None
-    active_cache = os.path.join(ARGS.volume_dir, 'cache.active')
-    frozen_cache = os.path.join(ARGS.volume_dir, 'cache.frozen')
+    block_map = os.path.join(ARGS.volume_dir, 'block_map')
+    map_fd = os.open(block_map, os.O_CREAT | os.O_RDWR)
+    os.lseek(map_fd, ARGS.block_count * 16, os.SEEK_SET)
+    os.write(map_fd, b'CBD')
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -171,23 +172,6 @@ def server(sock):
         block_count = length // ARGS.block_size
         block_offset = offset // ARGS.block_size
 
-        if active_fd and os.path.isfile(active_cache):
-            file_size = os.fstat(active_fd).st_blocks * 512
-            if file_size > (ARGS.cache_block_count * ARGS.block_size) / 2:
-                if frozen_fd is None:
-                    os.rename(active_cache, frozen_cache)
-                    frozen_fd = active_fd
-                    active_fd = None
-
-        if active_fd is None:
-            active_fd = os.open(active_cache, os.O_CREAT | os.O_RDWR)
-            cache_file_size = header_block_size * ARGS.block_count
-            os.lseek(active_fd, cache_file_size, os.SEEK_SET)
-            os.write(active_fd, b'CBD')
-
-        if frozen_fd is None and os.path.isfile(frozen_cache):
-            frozen_fd = os.open(frozen_cache, os.O_RDONLY)
-
         # READ
         if 0 == cmd:
             blocks = list()
@@ -195,22 +179,29 @@ def server(sock):
             for i in range(block_count):
                 j = block_offset + i
 
-                num = lsn = usec = block = chksum = b''
-                for fd in (active_fd, frozen_fd):
-                    if fd is not None:
-                        os.lseek(fd, j*header_block_size, os.SEEK_SET)
+                hdr = b'\x00' * 24
+                block = b'\x00' * ARGS.block_size
+                chksum = b'\x00' * 32
 
-                        hdr = os.read(fd, 24)
-                        block = os.read(fd, ARGS.block_size)
-                        chksum = os.read(fd, 32)
+                if j in logs:
+                    hdr, block, chksum = logs[j]
+                else:
+                    os.lseek(map_fd, j*16, os.SEEK_SET)
+                    lsn, index = struct.unpack('!QQ', os.read(map_fd, 16))
 
-                        num, lsn, usec = struct.unpack('!QQQ', hdr)
+                    if os.path.isfile(os.path.join(logdir, str(lsn))):
+                        with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
+                            fd.seek(index * header_block_size)
+                            hdr = fd.read(24)
+                            block = fd.read(ARGS.block_size)
+                            chksum = fd.read(32)
 
-                        if chksum != zerobuf:
-                            break
+                num, lsn, usec = struct.unpack('!QQQ', hdr)
 
                 if num not in (0, j):
-                    log(('corrupt block', j, num))
+                    log('cmd(%s) offset(%d) length(%d) msec(%d)',
+                        commands[cmd], offset, length, (time.time()-ts)*1000)
+                    log(('corrupt block', j, num, lsn, usec))
                     os._exit(0)
 
                 if chksum != zerobuf:
@@ -240,34 +231,30 @@ def server(sock):
                 sha = hashlib.sha256(hdr)
                 sha.update(block)
 
-                logs[j] = b''.join([hdr, block, sha.digest()])
-
-                os.lseek(active_fd, j*header_block_size, os.SEEK_SET)
-                os.write(active_fd, logs[j])
+                logs[j] = [hdr, block, sha.digest()]
 
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 0.1:
+        if 3 == cmd or time.time() - logts > 1:
             if logs:
-                logbytes = b''.join(logs.values())
-                compressed = gzip.compress(logbytes, compresslevel=1)
-
                 log_seq_num += 1
 
                 tmpfile = os.path.join(logdir, uuid.uuid4().hex)
                 logfile = os.path.join(logdir, str(log_seq_num))
                 with open(tmpfile, 'wb') as fd:
-                    fd.write(struct.pack('!QQ', log_seq_num, len(compressed)))
-                    fd.write(compressed)
-                    fd.write(hashlib.sha256(compressed).digest())
+                    for i, k in enumerate(sorted(logs.keys())):
+                        fd.write(logs[k][0])
+                        fd.write(logs[k][1])
+                        fd.write(logs[k][2])
+
+                        os.lseek(map_fd, k*16, os.SEEK_SET)
+                        os.write(map_fd, struct.pack('!QQ', log_seq_num, i))
+
                 os.rename(tmpfile, logfile)
 
-                os.fsync(active_fd)
-
-                log('lsn(%d) blocks(%d) bytes(%d) compressed(%d) msec(%d)',
-                    log_seq_num, len(logs), len(logbytes), len(compressed),
-                    (time.time()-ts)*1000)
+                log('lsn(%d) blocks(%d) msec(%d)',
+                    log_seq_num, len(logs), (time.time()-ts)*1000)
 
                 logs = dict()
 
@@ -277,8 +264,8 @@ def server(sock):
 
             logts = time.time()
 
-        log('cmd(%s) offset(%d) length(%d) msec(%d)',
-            commands[cmd], offset, length, (time.time()-ts)*1000)
+        log('cmd(%s) offset(%d) count(%d) msec(%d)',
+            commands[cmd], block_offset, block_count, (time.time()-ts)*1000)
 
         if cmd not in (0, 1, 3):
             log('unsupported command')
