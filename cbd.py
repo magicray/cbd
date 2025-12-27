@@ -238,11 +238,10 @@ def server(sock, logdir, log_seq_num, map_fd):
                         os.write(map_fd, struct.pack('!QI', log_seq_num, i))
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
-
-                os.fsync(map_fd)
-                os.lseek(map_fd, ARGS.block_count*12, os.SEEK_SET)
-                os.write(map_fd, struct.pack('!Q', log_seq_num))
-                os.fsync(map_fd)
+                if 0 == log_seq_num % 10:
+                    os.fsync(map_fd)
+                    os.lseek(map_fd, ARGS.block_count*12, os.SEEK_SET)
+                    os.write(map_fd, struct.pack('!Q', log_seq_num))
 
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
@@ -278,8 +277,36 @@ def main():
     os.lseek(map_fd, ARGS.block_count * 12, os.SEEK_SET)
     map_lsn = struct.unpack('!Q', os.read(map_fd, 8))[0]
     log('log_lsn(%d) map_lsn(%d)', log_seq_num, map_lsn)
-    if log_seq_num != map_lsn:
-        os._exit(1)
+
+    for lsn in range(map_lsn+1, log_seq_num+1):
+        with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
+            i = 0
+            while True:
+                hdr = fd.read(24)
+                if not hdr:
+                    break
+
+                blk, logseq, usec = struct.unpack('!QQQ', hdr)
+
+                block = fd.read(ARGS.block_size)
+                chksum = fd.read(32)
+
+                sha = hashlib.sha256(hdr)
+                sha.update(block)
+
+                if logseq != lsn or sha.digest() != chksum:
+                    log('corrupt logfile(%d)', lsn)
+                    os._exit(1)
+
+                os.lseek(map_fd, blk*12, os.SEEK_SET)
+                os.write(map_fd, struct.pack('!QI', logseq, i))
+                i += 1
+
+            log('updated map(%d) blocks(%d)', lsn, i)
+
+        os.lseek(map_fd, ARGS.block_count * 12, os.SEEK_SET)
+        os.write(map_fd, struct.pack('!Q', lsn))
+        os.fsync(map_fd)
 
     """
     s3 = S3(ARGS.prefix,
