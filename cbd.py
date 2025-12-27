@@ -137,10 +137,6 @@ def server(sock, logdir, log_seq_num, map_fd):
 
     commands = ['read', 'write', None, 'flush']
 
-    # block + lsn + usec_timestamp + sha256
-    header_size = 8 + 8 + 8 + 32
-    header_block_size = ARGS.block_size + header_size
-
     logs = dict()
     logts = time.time()
 
@@ -181,11 +177,19 @@ def server(sock, logdir, log_seq_num, map_fd):
 
                     if os.path.isfile(os.path.join(logdir, str(lsn))):
                         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
-                            fd.seek(index * header_block_size)
+                            # each block also stores 24+32 bytes of metadata
+                            fd.seek(index * (ARGS.block_size + 56))
+
+                            # header : block_index, lsn, usec_timestamp
                             hdr = fd.read(24)
+
+                            # this is the actual data
                             block = fd.read(ARGS.block_size)
+
+                            # checksum - sha256
                             chksum = fd.read(32)
 
+                        # extract block_index, lsn, usec_timestamp
                         num, logseq, usec = struct.unpack('!QQQ', hdr)
 
                         if num != j or lsn != logseq:
@@ -196,8 +200,7 @@ def server(sock, logdir, log_seq_num, map_fd):
                         sha.update(block)
                         if sha.digest() != chksum:
                             log(block)
-                            log(('corrupt block', j, num, offset, length,
-                                 chksum))
+                            log(('corrupt block', num, lsn, usec, chksum))
                             os._exit(0)
 
                 blocks.append(block)
@@ -230,15 +233,17 @@ def server(sock, logdir, log_seq_num, map_fd):
                 tmpfile = os.path.join(logdir, uuid.uuid4().hex)
                 with open(tmpfile, 'wb') as fd:
                     for i, k in enumerate(sorted(logs.keys())):
-                        fd.write(logs[k][0])
-                        fd.write(logs[k][1])
-                        fd.write(logs[k][2])
+                        fd.write(logs[k][0])  # header
+                        fd.write(logs[k][1])  # block
+                        fd.write(logs[k][2])  # checksum
 
+                        # map : lsn+offset (8+4 bytes)
                         os.lseek(map_fd, k*12, os.SEEK_SET)
                         os.write(map_fd, struct.pack('!QI', log_seq_num, i))
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
                 if 0 == log_seq_num % 10:
+                    # sync map file to disk periodically
                     os.fsync(map_fd)
                     os.lseek(map_fd, ARGS.block_count*12, os.SEEK_SET)
                     os.write(map_fd, struct.pack('!Q', log_seq_num))
