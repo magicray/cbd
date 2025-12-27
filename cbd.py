@@ -129,7 +129,7 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
-def server(sock):
+def server(sock, logdir, log_seq_num, map_fd):
     conn, peer = sock.accept()
     log('client connection accepted')
 
@@ -143,14 +143,6 @@ def server(sock):
 
     logs = dict()
     logts = time.time()
-    logdir = os.path.join(ARGS.volume_dir, 'logs')
-    logfiles = [int(f) for f in os.listdir(logdir)]
-    log_seq_num = max(logfiles) if logfiles else 0
-
-    block_map = os.path.join(ARGS.volume_dir, 'block_map')
-    map_fd = os.open(block_map, os.O_CREAT | os.O_RDWR)
-    os.lseek(map_fd, 6 * ARGS.block_count, os.SEEK_SET)
-    os.write(map_fd, b'MAP')
 
     while True:
         magic, flags, cmd, cookie, offset, length = struct.unpack(
@@ -184,8 +176,8 @@ def server(sock):
                 if j in logs:
                     block = logs[j][1]
                 else:
-                    os.lseek(map_fd, j*6, os.SEEK_SET)
-                    lsn, index = struct.unpack('!IH', os.read(map_fd, 6))
+                    os.lseek(map_fd, j*12, os.SEEK_SET)
+                    lsn, index = struct.unpack('!QI', os.read(map_fd, 12))
 
                     if os.path.isfile(os.path.join(logdir, str(lsn))):
                         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
@@ -218,24 +210,20 @@ def server(sock):
             octets = recvall(conn, length)
 
             for i in range(block_count):
-                j = block_offset + i
                 block = octets[i*ARGS.block_size:(i+1)*ARGS.block_size]
 
                 usec = int(time.time()*1000000)
-                hdr = struct.pack('!QQQ', j, log_seq_num+1, usec)
+                hdr = struct.pack('!QQQ', block_offset+i, log_seq_num+1, usec)
 
                 sha = hashlib.sha256(hdr)
                 sha.update(block)
 
-                logs[j] = [hdr, block, sha.digest()]
+                logs[block_offset+i] = [hdr, block, sha.digest()]
 
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 1 or len(logs) > 30000:
-            if len(logs) > 60000:
-                os._exit(1)
-
+        if 3 == cmd or time.time() - logts > 1:
             if logs:
                 log_seq_num += 1
 
@@ -246,10 +234,14 @@ def server(sock):
                         fd.write(logs[k][1])
                         fd.write(logs[k][2])
 
-                        os.lseek(map_fd, k*6, os.SEEK_SET)
-                        os.write(map_fd, struct.pack('!IH', log_seq_num, i))
+                        os.lseek(map_fd, k*12, os.SEEK_SET)
+                        os.write(map_fd, struct.pack('!QI', log_seq_num, i))
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
+
+                os.fsync(map_fd)
+                os.lseek(map_fd, ARGS.block_count*12, os.SEEK_SET)
+                os.write(map_fd, struct.pack('!Q', log_seq_num))
                 os.fsync(map_fd)
 
                 log('lsn(%d) blocks(%d) msec(%d)',
@@ -272,7 +264,23 @@ def server(sock):
 
 
 def main():
-    os.makedirs(os.path.join(ARGS.volume_dir, 'logs'), exist_ok=True)
+    logdir = os.path.join(ARGS.volume_dir, 'logs')
+    os.makedirs(logdir, exist_ok=True)
+
+    logfiles = [int(f) for f in os.listdir(logdir)]
+    log_seq_num = max(logfiles) if logfiles else 0
+
+    block_map = os.path.join(ARGS.volume_dir, 'block_map')
+    map_fd = os.open(block_map, os.O_CREAT | os.O_RDWR)
+    os.lseek(map_fd, ARGS.block_count * 12 + 8, os.SEEK_SET)
+    os.write(map_fd, b'MAP')
+
+    os.lseek(map_fd, ARGS.block_count * 12, os.SEEK_SET)
+    map_lsn = struct.unpack('!Q', os.read(map_fd, 8))[0]
+    log('log_lsn(%d) map_lsn(%d)', log_seq_num, map_lsn)
+    if log_seq_num != map_lsn:
+        os._exit(1)
+
     """
     s3 = S3(ARGS.prefix,
             os.environ['CBD_S3_ENDPOINT'], os.environ['CBD_S3_BUCKET'],
@@ -290,7 +298,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock,)
+    args = (server_sock, logdir, log_seq_num, map_fd)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
@@ -316,9 +324,6 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--block_count', type=int, default=25*1024*1024,
                       help='Device Block Count')
-
-    ARGS.add_argument('--cache_block_count', type=int, default=512*1024,
-                      help='maximum cacheed blocks')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
