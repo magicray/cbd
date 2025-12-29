@@ -50,7 +50,7 @@ def device_init(dev, block_size, block_count, conn):
 
 
 class S3:
-    def __init__(self, endpoint, bucket, prefix=''):
+    def __init__(self, endpoint, bucket, prefix):
         self.prefix = prefix
         self.bucket = bucket
         self.endpoint = endpoint
@@ -84,7 +84,7 @@ class S3:
 
 
 def backup(log_seq_num, logdir):
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket)
+    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
 
     while True:
         lsn = log_seq_num + 1
@@ -120,7 +120,7 @@ def recvall(conn, length):
 
 
 def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket)
+    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
 
     conn, peer = sock.accept()
     log('client connection accepted')
@@ -265,7 +265,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
 
 
 def download_lsnfile(s3, lsn):
-    lsnfile = os.path.join(ARGS.volume_dir, 'logs', str(lsn))
+    lsnfile = os.path.join(ARGS.volume_dir, 'log', str(lsn))
 
     if not os.path.isfile(lsnfile):
         octets = gzip.decompress(s3.get(f'log/{lsn}'))
@@ -280,8 +280,7 @@ def download_lsnfile(s3, lsn):
 
 
 def main():
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket)
-    # s3.put('tail.json', json.dumps(dict(lsn=0)))
+    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
     tail = json.loads(s3.get('tail.json'))
     config = json.loads(s3.get('config.json'))
 
@@ -289,7 +288,7 @@ def main():
     block_count = config['block_count']
     log_seq_num = tail['lsn']
 
-    logdir = os.path.join(ARGS.volume_dir, 'logs')
+    logdir = os.path.join(ARGS.volume_dir, 'log')
     os.makedirs(logdir, exist_ok=True)
 
     block_map = os.path.join(ARGS.volume_dir, 'block_map')
@@ -369,12 +368,29 @@ if __name__ == '__main__':
     ARGS.add_argument('--s3bucket', default='cloudblockdevice',
                       help='S3 bucket')
 
+    ARGS.add_argument('--s3prefix', default='volume',
+                      help='S3 prefix for namespace')
+
     ARGS.add_argument('--device', default='/dev/nbd0',
                       help='Network Block Device path')
 
     ARGS.add_argument('--volume_dir', default='volume',
                       help='volume write area')
 
+    ARGS.add_argument('--block_size', type=int, help='Device block size')
+    ARGS.add_argument('--block_count', type=int, help='Device block count')
+
     ARGS = ARGS.parse_args()
 
-    main()
+    if ARGS.block_size is None and ARGS.block_count is None:
+        main()
+    else:
+        s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
+        s3.put('config.json', json.dumps(dict(
+            block_size=ARGS.block_size,
+            block_count=ARGS.block_count)))
+        s3.put('tail.json', json.dumps(dict(lsn=0)))
+
+        log('Device initialized')
+        log(json.loads(s3.get('tail.json')))
+        log(json.loads(s3.get('config.json')))
