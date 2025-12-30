@@ -35,7 +35,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_CLEAR_SOCK)
     fcntl.ioctl(fd, NBD_SET_BLKSIZE, block_size)
     fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, block_count)
-    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 30)
+    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 300)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
@@ -72,7 +72,7 @@ class S3:
                 fd.write(value)
             os.rename(tmpfile, os.path.join(self.bucket, key))
 
-        log('bucket(%s/%s) create(%s) length(%d) msec(%d)',
+        log('bucket(%s/%s) put(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
 
@@ -95,7 +95,7 @@ class S3:
             else:
                 octets = ''
 
-        log('bucket(%s/%s) read(%s) length(%d) msec(%d)',
+        log('bucket(%s/%s) get(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(octets),
             (time.time()-ts) * 1000)
 
@@ -116,8 +116,7 @@ def backup(log_seq_num, logdir):
         with open(lsnfile, 'rb') as fd:
             octets = fd.read()
 
-        compressed = gzip.compress(octets, compresslevel=1)
-        s3.put(f'log/{lsn}', compressed)
+        s3.put(f'log/{lsn}', octets)
         s3.put('tail.json', json.dumps(dict(lsn=lsn)).encode())
 
         log_seq_num = lsn
@@ -181,10 +180,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
                 block = zero_block
 
                 if j in logs:
-                    block = logs[j][1]
+                    block = gzip.decompress(logs[j][1])
                 else:
-                    os.lseek(map_fd, j*12, os.SEEK_SET)
-                    lsn, index = struct.unpack('!QI', os.read(map_fd, 12))
+                    os.lseek(map_fd, j*16, os.SEEK_SET)
+                    lsn, index = struct.unpack('!QQ', os.read(map_fd, 16))
 
                     if lsn:
                         download_lsnfile(s3, lsn)
@@ -192,20 +191,20 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
                     lsn_file = os.path.join(logdir, str(lsn))
                     if os.path.isfile(lsn_file):
                         with open(lsn_file, 'rb') as fd:
-                            # each block also stores 24+32 bytes of metadata
-                            fd.seek(index * (block_size + 56))
+                            fd.seek(index)
 
-                            # header : block_index, lsn, usec_timestamp
-                            hdr = fd.read(24)
+                            # header : block_index, lsn, usec_timestamp, length
+                            hdr = fd.read(32)
+
+                            # extract block_index, lsn, usec_timestamp
+                            num, logseq, usec, length = struct.unpack(
+                                '!QQQQ', hdr)
 
                             # this is the actual data
-                            block = fd.read(block_size)
+                            block = fd.read(length)
 
                             # checksum - sha256
                             chksum = fd.read(32)
-
-                        # extract block_index, lsn, usec_timestamp
-                        num, logseq, usec = struct.unpack('!QQQ', hdr)
 
                         if num != j or lsn != logseq:
                             log(('corrupt block', j, num, lsn, logseq, usec))
@@ -218,6 +217,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
                             log(('corrupt block', num, lsn, usec, chksum))
                             os._exit(0)
 
+                        block = gzip.decompress(block)
+
                 blocks.append(block)
 
             conn.sendall(response_header)
@@ -229,14 +230,15 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
 
             for i in range(block_count):
                 block = octets[i*block_size:(i+1)*block_size]
+                compressed = gzip.compress(block, compresslevel=1)
 
-                usec = int(time.time()*1000000)
-                hdr = struct.pack('!QQQ', block_offset+i, log_seq_num+1, usec)
+                hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
+                                  int(time.time()*1000000), len(compressed))
 
                 sha = hashlib.sha256(hdr)
-                sha.update(block)
+                sha.update(compressed)
 
-                logs[block_offset+i] = [hdr, block, sha.digest()]
+                logs[block_offset+i] = [hdr, compressed, sha.digest()]
 
             conn.sendall(response_header)
 
@@ -245,23 +247,26 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
             if logs:
                 log_seq_num += 1
 
+                i = 0
                 tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
                 with open(tmpfile, 'wb') as fd:
-                    for i, k in enumerate(sorted(logs.keys())):
+                    for k in sorted(logs.keys()):
                         fd.write(logs[k][0])  # header
                         fd.write(logs[k][1])  # block
                         fd.write(logs[k][2])  # checksum
 
                         # map : lsn+offset (8+4 bytes)
-                        os.lseek(map_fd, k*12, os.SEEK_SET)
-                        os.write(map_fd, struct.pack('!QI', log_seq_num, i))
+                        os.lseek(map_fd, k*16, os.SEEK_SET)
+                        os.write(map_fd, struct.pack('!QQ', log_seq_num, i))
+
+                        i += len(logs[k][1]) + 64
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
                 if 0 == log_seq_num % 10:
                     # sync map file to disk periodically
                     os.fsync(map_fd)
-                    os.lseek(map_fd, device_block_count*12, os.SEEK_SET)
+                    os.lseek(map_fd, device_block_count*16, os.SEEK_SET)
                     os.write(map_fd, struct.pack('!Q', log_seq_num))
 
                 log('lsn(%d) blocks(%d) msec(%d)',
@@ -287,9 +292,9 @@ def download_lsnfile(s3, lsn):
     lsnfile = os.path.join(ARGS.volume_dir, 'log', str(lsn))
 
     if not os.path.isfile(lsnfile):
-        octets = gzip.decompress(s3.get(f'log/{lsn}'))
+        octets = s3.get(f'log/{lsn}')
         if not octets:
-            log(f'invalid lsn{lsn}')
+            log(f'invalid lsn({lsn})')
             os._exit(1)
 
         tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
@@ -312,10 +317,10 @@ def main():
 
     block_map = os.path.join(ARGS.volume_dir, 'block_map')
     map_fd = os.open(block_map, os.O_CREAT | os.O_RDWR)
-    os.lseek(map_fd, block_count*12 + 8, os.SEEK_SET)
+    os.lseek(map_fd, block_count*16 + 8, os.SEEK_SET)
     os.write(map_fd, b'MAP')
 
-    os.lseek(map_fd, block_count*12, os.SEEK_SET)
+    os.lseek(map_fd, block_count*16, os.SEEK_SET)
     map_lsn = struct.unpack('!Q', os.read(map_fd, 8))[0]
     log('log_seq_num(%d) map_lsn(%d)', log_seq_num, map_lsn)
 
@@ -323,14 +328,15 @@ def main():
         download_lsnfile(s3, lsn)
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
             i = 0
+            j = 0
             while True:
-                hdr = fd.read(24)
+                hdr = fd.read(32)
                 if not hdr:
                     break
 
-                blk, logseq, usec = struct.unpack('!QQQ', hdr)
+                blk, logseq, usec, length = struct.unpack('!QQQQ', hdr)
 
-                block = fd.read(block_size)
+                block = fd.read(length)
                 chksum = fd.read(32)
 
                 sha = hashlib.sha256(hdr)
@@ -340,13 +346,14 @@ def main():
                     log('corrupt logfile(%d)', lsn)
                     os._exit(1)
 
-                os.lseek(map_fd, blk*12, os.SEEK_SET)
-                os.write(map_fd, struct.pack('!QI', logseq, i))
-                i += 1
+                os.lseek(map_fd, blk*16, os.SEEK_SET)
+                os.write(map_fd, struct.pack('!QQ', logseq, i))
+                i += length + 64
+                j += 1
 
-            log('updated map(%d) blocks(%d)', lsn, i)
+            log('updated map(%d) blocks(%d)', lsn, j)
 
-        os.lseek(map_fd, block_count * 12, os.SEEK_SET)
+        os.lseek(map_fd, block_count * 16, os.SEEK_SET)
         os.write(map_fd, struct.pack('!Q', lsn))
         os.fsync(map_fd)
 
