@@ -55,12 +55,23 @@ class S3:
         self.bucket = bucket
         self.endpoint = endpoint
 
-        self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
+        if self.endpoint:
+            self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
+        else:
+            os.makedirs(os.path.join(bucket, prefix, 'log'), exist_ok=True)
 
     def put(self, key, value):
         ts = time.time()
         key = os.path.join(self.prefix, key)
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=value)
+
+        if self.endpoint:
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=value)
+        else:
+            tmpfile = os.path.join(self.bucket, uuid.uuid4().hex)
+            with open(tmpfile, 'wb') as fd:
+                fd.write(value)
+            os.rename(tmpfile, os.path.join(self.bucket, key))
+
         log('bucket(%s/%s) create(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
@@ -69,12 +80,20 @@ class S3:
         ts = time.time()
         key = os.path.join(self.prefix, key)
 
-        try:
-            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-            octets = obj['Body'].read()
-            assert (len(octets) == obj['ContentLength'])
-        except self.s3.exceptions.NoSuchKey:
-            octets = ''
+        if self.endpoint:
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+                octets = obj['Body'].read()
+                assert (len(octets) == obj['ContentLength'])
+            except self.s3.exceptions.NoSuchKey:
+                octets = ''
+        else:
+            path = os.path.join(self.bucket, key)
+            if os.path.isfile(path):
+                with open(path, 'rb') as fd:
+                    octets = fd.read()
+            else:
+                octets = ''
 
         log('bucket(%s/%s) read(%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(octets),
@@ -99,7 +118,7 @@ def backup(log_seq_num, logdir):
 
         compressed = gzip.compress(octets, compresslevel=1)
         s3.put(f'log/{lsn}', compressed)
-        s3.put('tail.json', json.dumps(dict(lsn=lsn)))
+        s3.put('tail.json', json.dumps(dict(lsn=lsn)).encode())
 
         log_seq_num = lsn
 
@@ -281,8 +300,8 @@ def download_lsnfile(s3, lsn):
 
 def main():
     s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
-    tail = json.loads(s3.get('tail.json'))
-    config = json.loads(s3.get('config.json'))
+    tail = json.loads(s3.get('tail.json').decode())
+    config = json.loads(s3.get('config.json').decode())
 
     block_size = config['block_size']
     block_count = config['block_count']
@@ -388,9 +407,9 @@ if __name__ == '__main__':
         s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
         s3.put('config.json', json.dumps(dict(
             block_size=ARGS.block_size,
-            block_count=ARGS.block_count)))
-        s3.put('tail.json', json.dumps(dict(lsn=0)))
+            block_count=ARGS.block_count)).encode())
+        s3.put('tail.json', json.dumps(dict(lsn=0)).encode())
 
         log('Device initialized')
-        log(json.loads(s3.get('tail.json')))
-        log(json.loads(s3.get('config.json')))
+        log(json.loads(s3.get('tail.json').decode()))
+        log(json.loads(s3.get('config.json').decode()))
