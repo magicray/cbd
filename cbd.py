@@ -35,7 +35,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_CLEAR_SOCK)
     fcntl.ioctl(fd, NBD_SET_BLKSIZE, block_size)
     fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, block_count)
-    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 300)
+    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 30)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
@@ -243,7 +243,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 1:
+        if 3 == cmd or time.time() - logts > 10:
             if logs:
                 log_seq_num += 1
 
@@ -263,11 +263,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
-                if 0 == log_seq_num % 10:
-                    # sync map file to disk periodically
-                    os.fsync(map_fd)
-                    os.lseek(map_fd, device_block_count*16, os.SEEK_SET)
-                    os.write(map_fd, struct.pack('!Q', log_seq_num))
+                # sync map file to disk
+                os.fsync(map_fd)
+                os.lseek(map_fd, device_block_count*16, os.SEEK_SET)
+                os.write(map_fd, struct.pack('!Q', log_seq_num))
 
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
