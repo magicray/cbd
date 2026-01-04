@@ -7,6 +7,7 @@ import boto3
 import fcntl
 import struct
 import socket
+import sqlite3
 import logging
 import hashlib
 import argparse
@@ -35,7 +36,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_CLEAR_SOCK)
     fcntl.ioctl(fd, NBD_SET_BLKSIZE, block_size)
     fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, block_count)
-    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 30)
+    fcntl.ioctl(fd, NBD_SET_TIMEOUT, 60)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
@@ -137,7 +138,8 @@ def recvall(conn, length):
     return b''.join(buf)
 
 
-def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
+def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
+    db = sqlite3.connect(db)
     s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
 
     conn, peer = sock.accept()
@@ -182,8 +184,13 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
                 if j in logs:
                     block = gzip.decompress(logs[j][1])
                 else:
-                    os.lseek(map_fd, j*16, os.SEEK_SET)
-                    lsn, index = struct.unpack('!QQ', os.read(map_fd, 16))
+                    row = db.execute('''select lsn, offset from blocks
+                                        where block=?
+                                     ''', [j]).fetchone()
+                    if row is None:
+                        lsn, index = 0, 0
+                    else:
+                        lsn, index = row
 
                     if lsn:
                         download_lsnfile(s3, lsn)
@@ -243,7 +250,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 10:
+        if 3 == cmd or time.time() - logts > 1:
             if logs:
                 log_seq_num += 1
 
@@ -255,18 +262,15 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, map_fd):
                         fd.write(logs[k][1])  # block
                         fd.write(logs[k][2])  # checksum
 
-                        # map : lsn+offset (8+4 bytes)
-                        os.lseek(map_fd, k*16, os.SEEK_SET)
-                        os.write(map_fd, struct.pack('!QQ', log_seq_num, i))
+                        db.execute('delete from blocks where block=?', [k])
+                        db.execute('''insert into blocks (block,lsn,offset)
+                                      values(?,?,?)
+                                   ''', [k, log_seq_num, i])
 
                         i += len(logs[k][1]) + 64
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
-
-                # sync map file to disk
-                os.fsync(map_fd)
-                os.lseek(map_fd, device_block_count*16, os.SEEK_SET)
-                os.write(map_fd, struct.pack('!Q', log_seq_num))
+                db.commit()
 
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
@@ -307,23 +311,28 @@ def main():
     tail = json.loads(s3.get('tail.json').decode())
     config = json.loads(s3.get('config.json').decode())
 
+    logdir = os.path.join(ARGS.volume_dir, 'log')
+    os.makedirs(logdir, exist_ok=True)
+
+    index_db = os.path.join(ARGS.volume_dir, 'index.sqlite3')
+    db = sqlite3.connect(index_db)
+    db.execute('''create table if not exists blocks(
+                      block  unsigned int primary key,
+                      lsn    unsigned int,
+                      offset unsigned int)
+               ''')
+
     block_size = config['block_size']
     block_count = config['block_count']
     log_seq_num = tail['lsn']
 
-    logdir = os.path.join(ARGS.volume_dir, 'log')
-    os.makedirs(logdir, exist_ok=True)
+    max_lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
+    if max_lsn is None:
+        max_lsn = 0
 
-    block_map = os.path.join(ARGS.volume_dir, 'block_map')
-    map_fd = os.open(block_map, os.O_CREAT | os.O_RDWR)
-    os.lseek(map_fd, block_count*16 + 8, os.SEEK_SET)
-    os.write(map_fd, b'MAP')
+    log('log_seq_num(%d) max_lsn(%d)', log_seq_num, max_lsn)
 
-    os.lseek(map_fd, block_count*16, os.SEEK_SET)
-    map_lsn = struct.unpack('!Q', os.read(map_fd, 8))[0]
-    log('log_seq_num(%d) map_lsn(%d)', log_seq_num, map_lsn)
-
-    for lsn in range(map_lsn+1, log_seq_num+1):
+    for lsn in range(max_lsn+1, log_seq_num+1):
         download_lsnfile(s3, lsn)
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
             i = 0
@@ -345,16 +354,25 @@ def main():
                     log('corrupt logfile(%d)', lsn)
                     os._exit(1)
 
-                os.lseek(map_fd, blk*16, os.SEEK_SET)
-                os.write(map_fd, struct.pack('!QQ', logseq, i))
+                db.execute('delete from blocks where block=?', [blk])
+                db.execute('''insert into blocks (block,lsn,offset)
+                              values(?,?,?)
+                           ''', [blk, logseq, i])
                 i += length + 64
                 j += 1
 
+            db.commit()
             log('updated map(%d) blocks(%d)', lsn, j)
 
-        os.lseek(map_fd, block_count * 16, os.SEEK_SET)
-        os.write(map_fd, struct.pack('!Q', lsn))
-        os.fsync(map_fd)
+    rows = db.execute('select distinct lsn from blocks').fetchall()
+    lsn_set = set([r[0] for r in rows])
+    db.close()
+
+    log_file_list = [int(f) for f in os.listdir(logdir) if f.isdigit()]
+    for f in sorted(log_file_list):
+        if f not in lsn_set:
+            os.remove(os.path.join(logdir, str(f)))
+            log('deleted unused file lsn(%d)', f)
 
     # Start the backup thread
     args = (log_seq_num, logdir)
@@ -369,7 +387,7 @@ def main():
 
     # Start the server thread
     args = (server_sock, block_size, block_count,
-            logdir, log_seq_num, map_fd)
+            logdir, log_seq_num, index_db)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
