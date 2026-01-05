@@ -255,6 +255,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 log_seq_num += 1
 
                 i = 0
+                deletes = list()
+                inserts = list()
                 tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
                 with open(tmpfile, 'wb') as fd:
                     for k in sorted(logs.keys()):
@@ -262,16 +264,18 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                         fd.write(logs[k][1])  # block
                         fd.write(logs[k][2])  # checksum
 
-                        db.execute('delete from blocks where block=?', [k])
-                        db.execute('''insert into blocks
-                                      (block,lsn,offset,length)
-                                      values(?,?,?,?)
-                                   ''', [k, log_seq_num, i, len(logs[k][1])])
+                        deletes.append([k])
+                        inserts.append([k, log_seq_num, i, len(logs[k][1])])
 
                         i += len(logs[k][1]) + 64
 
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
-                db.commit()
+
+                db.executemany('delete from blocks where block=?', deletes)
+                db.executemany('''insert into blocks
+                                  (block,lsn,offset,length)
+                                  values(?,?,?,?)
+                               ''', inserts)
 
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
@@ -280,6 +284,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
             # send response to FLUSH command
             if 3 == cmd:
+                db.commit()
                 conn.sendall(response_header)
 
             logts = time.time()
