@@ -1,6 +1,5 @@
 import os
 import time
-import gzip
 import uuid
 import json
 import boto3
@@ -11,6 +10,7 @@ import sqlite3
 import logging
 import hashlib
 import argparse
+import lz4.block
 import threading
 from logging import critical as log
 
@@ -40,8 +40,9 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
-    # set FLUSH option
-    fcntl.ioctl(fd, NBD_SET_FLAGS, 5)
+    # set options : WRITE_ZEROS(64), TRIM(32), FLUSH(4)
+    #fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
+    fcntl.ioctl(fd, NBD_SET_FLAGS, 4+1)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
         dev, block_size, block_count)
@@ -149,6 +150,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
     commands = ['read', 'write', None, 'flush']
 
+    fds = dict()
     logs = dict()
     logts = time.time()
 
@@ -182,7 +184,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 block = zero_block
 
                 if j in logs:
-                    block = gzip.decompress(logs[j][1])
+                    block = lz4.block.decompress(logs[j][1])
                 else:
                     row = db.execute('''select lsn, offset from blocks
                                         where block=?
@@ -197,21 +199,24 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
                     lsn_file = os.path.join(logdir, str(lsn))
                     if os.path.isfile(lsn_file):
-                        with open(lsn_file, 'rb') as fd:
-                            fd.seek(index)
+                        if lsn_file not in fds:
+                            fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
 
-                            # header : block_index, lsn, usec_timestamp, length
-                            hdr = fd.read(32)
+                        fd = fds[lsn_file]
+                        os.lseek(fd, index, os.SEEK_SET)
 
-                            # extract block_index, lsn, usec_timestamp
-                            num, logseq, usec, length = struct.unpack(
-                                '!QQQQ', hdr)
+                        # header : block_index, lsn, usec_timestamp, length
+                        hdr = os.read(fd, 32)
 
-                            # this is the actual data
-                            block = fd.read(length)
+                        # extract block_index, lsn, usec_timestamp
+                        num, logseq, usec, length = struct.unpack(
+                            '!QQQQ', hdr)
 
-                            # checksum - sha256
-                            chksum = fd.read(32)
+                        # this is the actual data
+                        block = os.read(fd, length)
+
+                        # checksum - sha256
+                        chksum = os.read(fd, 32)
 
                         if num != j or lsn != logseq:
                             log(('corrupt block', j, num, lsn, logseq, usec))
@@ -224,7 +229,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                             log(('corrupt block', num, lsn, usec, chksum))
                             os._exit(0)
 
-                        block = gzip.decompress(block)
+                        block = lz4.block.decompress(block)
 
                 blocks.append(block)
 
@@ -237,7 +242,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
             for i in range(block_count):
                 block = octets[i*block_size:(i+1)*block_size]
-                compressed = gzip.compress(block, compresslevel=1)
+                compressed = lz4.block.compress(block)
 
                 hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
                                   int(time.time()*1000000), len(compressed))
