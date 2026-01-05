@@ -186,13 +186,13 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 if j in logs:
                     block = lz4.block.decompress(logs[j][1])
                 else:
-                    row = db.execute('''select lsn, offset from blocks
+                    row = db.execute('''select lsn, offset, length from blocks
                                         where block=?
                                      ''', [j]).fetchone()
                     if row is None:
-                        lsn, index = 0, 0
+                        lsn, index, length = 0, 0, 0
                     else:
-                        lsn, index = row
+                        lsn, index, length = row
 
                     if lsn:
                         download_lsnfile(s3, lsn)
@@ -204,19 +204,20 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
                         fd = fds[lsn_file]
                         os.lseek(fd, index, os.SEEK_SET)
+                        octets = os.read(fd, length+64)
 
                         # header : block_index, lsn, usec_timestamp, length
-                        hdr = os.read(fd, 32)
+                        hdr = octets[:32]
 
                         # extract block_index, lsn, usec_timestamp
                         num, logseq, usec, length = struct.unpack(
                             '!QQQQ', hdr)
 
                         # this is the actual data
-                        block = os.read(fd, length)
+                        block = octets[32:-32]
 
                         # checksum - sha256
-                        chksum = os.read(fd, 32)
+                        chksum = octets[-32:]
 
                         if num != j or lsn != logseq:
                             log(('corrupt block', j, num, lsn, logseq, usec))
@@ -268,9 +269,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                         fd.write(logs[k][2])  # checksum
 
                         db.execute('delete from blocks where block=?', [k])
-                        db.execute('''insert into blocks (block,lsn,offset)
-                                      values(?,?,?)
-                                   ''', [k, log_seq_num, i])
+                        db.execute('''insert into blocks
+                                      (block,lsn,offset,length)
+                                      values(?,?,?,?)
+                                   ''', [k, log_seq_num, i, len(logs[k][1])])
 
                         i += len(logs[k][1]) + 64
 
@@ -324,7 +326,8 @@ def main():
     db.execute('''create table if not exists blocks(
                       block  unsigned int primary key,
                       lsn    unsigned int,
-                      offset unsigned int)
+                      offset unsigned int,
+                      length unsigned int)
                ''')
 
     block_size = config['block_size']
@@ -360,9 +363,9 @@ def main():
                     os._exit(1)
 
                 db.execute('delete from blocks where block=?', [blk])
-                db.execute('''insert into blocks (block,lsn,offset)
-                              values(?,?,?)
-                           ''', [blk, logseq, i])
+                db.execute('''insert into blocks (block,lsn,offset, length)
+                              values(?,?,?,?)
+                           ''', [blk, logseq, i, length])
                 i += length + 64
                 j += 1
 
