@@ -41,7 +41,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
     # set options : WRITE_ZEROS(64), TRIM(32), FLUSH(4)
-    #fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
+    # fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
     fcntl.ioctl(fd, NBD_SET_FLAGS, 4+1)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
@@ -146,7 +146,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    zero_block = b'\x00' * block_size
+    zero_block = lz4.block.compress(b'\x00' * block_size)
 
     commands = ['read', 'write', None, 'flush']
 
@@ -178,21 +178,22 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         if 0 == cmd:
             blocks = list()
 
-            for i in range(block_count):
-                j = block_offset + i
+            rows = db.execute('''select block, lsn, offset, length from blocks
+                                 where block between ? and ?
+                              ''', [block_offset, block_offset+block_count])
+            if rows:
+                rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
 
+            for i in range(block_offset, block_offset+block_count):
                 block = zero_block
 
-                if j in logs:
-                    block = lz4.block.decompress(logs[j][1])
+                if i in logs:
+                    block = logs[i][1]
                 else:
-                    row = db.execute('''select lsn, offset, length from blocks
-                                        where block=?
-                                     ''', [j]).fetchone()
-                    if row is None:
-                        lsn, index, length = 0, 0, 0
+                    if i in rows:
+                        lsn, index, length = rows[i]
                     else:
-                        lsn, index, length = row
+                        lsn, index, length = 0, 0, 0
 
                     if lsn:
                         download_lsnfile(s3, lsn)
@@ -202,16 +203,11 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                         if lsn_file not in fds:
                             fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
 
-                        fd = fds[lsn_file]
-                        os.lseek(fd, index, os.SEEK_SET)
-                        octets = os.read(fd, length+64)
+                        octets = os.pread(fds[lsn_file], length+64, index)
 
                         # header : block_index, lsn, usec_timestamp, length
                         hdr = octets[:32]
-
-                        # extract block_index, lsn, usec_timestamp
-                        num, logseq, usec, length = struct.unpack(
-                            '!QQQQ', hdr)
+                        num, logseq, usec, length = struct.unpack('!QQQQ', hdr)
 
                         # this is the actual data
                         block = octets[32:-32]
@@ -219,8 +215,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                         # checksum - sha256
                         chksum = octets[-32:]
 
-                        if num != j or lsn != logseq:
-                            log(('corrupt block', j, num, lsn, logseq, usec))
+                        if num != i or lsn != logseq:
+                            log(('corrupt block', i, num, lsn, logseq, usec))
                             os._exit(0)
 
                         sha = hashlib.sha256(hdr)
@@ -230,9 +226,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                             log(('corrupt block', num, lsn, usec, chksum))
                             os._exit(0)
 
-                        block = lz4.block.decompress(block)
-
-                blocks.append(block)
+                blocks.append(lz4.block.decompress(block))
 
             conn.sendall(response_header)
             conn.sendall(b''.join(blocks))
