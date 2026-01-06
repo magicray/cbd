@@ -187,7 +187,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 block = zero_block
 
                 if i in logs:
-                    block = logs[i][1]
+                    if len(logs[i][1]) > 0:
+                        block = logs[i][1]
                 else:
                     if i in rows:
                         lsn, index, length = rows[i]
