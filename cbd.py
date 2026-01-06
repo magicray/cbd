@@ -41,8 +41,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
     # set options : WRITE_ZEROS(64), TRIM(32), FLUSH(4)
-    # fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
-    fcntl.ioctl(fd, NBD_SET_FLAGS, 4+1)
+    fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
         dev, block_size, block_count)
@@ -148,7 +147,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
     zero_block = lz4.block.compress(b'\x00' * block_size)
 
-    commands = ['read', 'write', None, 'flush']
+    commands = ['read', 'write', '2', 'flush', 'trim', '5', '6']
 
     fds = dict()
     logs = dict()
@@ -249,6 +248,18 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
             conn.sendall(response_header)
 
+        # TRIM
+        if 4 == cmd:
+            for i in range(block_count):
+                hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
+                                  int(time.time()*1000000), 0)
+
+                sha = hashlib.sha256(hdr)
+
+                logs[block_offset+i] = [hdr, b'', sha.digest()]
+
+            conn.sendall(response_header)
+
         # FLUSH
         if 3 == cmd or time.time() - logts > 1:
             if logs:
@@ -272,10 +283,11 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
                 db.executemany('delete from blocks where block=?', deletes)
-                db.executemany('''insert into blocks
-                                  (block,lsn,offset,length)
-                                  values(?,?,?,?)
-                               ''', inserts)
+                if len(logs[k][1]) > 0:
+                    db.executemany('''insert into blocks
+                                      (block,lsn,offset,length)
+                                      values(?,?,?,?)
+                                   ''', inserts)
 
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
@@ -292,7 +304,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         log('cmd(%s) offset(%d) count(%d) msec(%d)',
             commands[cmd], block_offset, block_count, (time.time()-ts)*1000)
 
-        if cmd not in (0, 1, 3):
+        if cmd not in (0, 1, 3, 4):
             log('unsupported command')
             os._exit(1)
 
@@ -362,9 +374,10 @@ def main():
                     os._exit(1)
 
                 db.execute('delete from blocks where block=?', [blk])
-                db.execute('''insert into blocks (block,lsn,offset, length)
-                              values(?,?,?,?)
-                           ''', [blk, logseq, i, length])
+                if length > 0:
+                    db.execute('''insert into blocks (block,lsn,offset, length)
+                                  values(?,?,?,?)
+                               ''', [blk, logseq, i, length])
                 i += length + 64
                 j += 1
 
