@@ -20,7 +20,7 @@ def device_init(dev, block_size, block_count, conn):
     # Network Block Device ioctl commands
     NBD_SET_SOCK = 43776
     NBD_SET_BLKSIZE = 43777
-    NBD_SET_SIZE = 43778
+    # NBD_SET_SIZE = 43778
     NBD_DO_IT = 43779
     NBD_CLEAR_SOCK = 43780
     NBD_CLEAR_QUEUE = 43781
@@ -125,7 +125,9 @@ def backup(log_seq_num, logdir):
 
 def recvall(conn, length):
     buf = list()
-    while length:
+
+    remaining = length
+    while remaining:
         octets = conn.recv(length)
 
         if not octets:
@@ -133,9 +135,15 @@ def recvall(conn, length):
             raise Exception('connection closed')
 
         buf.append(octets)
-        length -= len(octets)
+        remaining -= len(octets)
 
-    return b''.join(buf)
+    octets = b''.join(buf)
+
+    if length != len(octets):
+        log(f'recvall length({length}) mismatch({len(octets)})')
+        os._exit(1)
+
+    return octets
 
 
 def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
@@ -154,7 +162,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     logts = time.time()
 
     while True:
-        magic, flags, cmd, cookie, offset, length = struct.unpack(
+        magic, flags, cmd, cookie, req_offset, req_length = struct.unpack(
             '!IHHQQI', recvall(conn, 28))
 
         ts = time.time()
@@ -163,15 +171,15 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             log(f'invalid magic({magic}) or cmd({cmd})')
             os._exit(1)
 
-        if 0 != offset % block_size or 0 != length % block_size:
-            log(f'invalid offset({offset}) or length({length})')
+        if 0 != req_offset % block_size or 0 != req_length % block_size:
+            log(f'invalid offset({req_offset}) or length({req_length})')
             os._exit(1)
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
-        block_count = length // block_size
-        block_offset = offset // block_size
+        block_count = req_length // block_size
+        block_offset = req_offset // block_size
 
         # READ
         if 0 == cmd:
@@ -227,24 +235,27 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
                 blocks.append(lz4.block.decompress(block))
 
+            octets = b''.join(blocks)
+
+            if len(octets) != req_length:
+                log(f'read length({req_length}) mismatch({len(octets)})')
+                os._exit(1)
+
             conn.sendall(response_header)
-            conn.sendall(b''.join(blocks))
+            conn.sendall(octets)
 
         # WRITE
         if 1 == cmd:
-            octets = recvall(conn, length)
+            for i in range(block_offset, block_offset+block_count):
+                compressed = lz4.block.compress(recvall(conn, block_size))
 
-            for i in range(block_count):
-                block = octets[i*block_size:(i+1)*block_size]
-                compressed = lz4.block.compress(block)
-
-                hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
+                hdr = struct.pack('!QQQQ', i, log_seq_num+1,
                                   int(time.time()*1000000), len(compressed))
 
                 sha = hashlib.sha256(hdr)
                 sha.update(compressed)
 
-                logs[block_offset+i] = [hdr, compressed, sha.digest()]
+                logs[i] = [hdr, compressed, sha.digest()]
 
             conn.sendall(response_header)
 
@@ -256,18 +267,17 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             if rows:
                 rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
 
-            for i in range(block_count):
-                blk = block_offset + i
-                if blk not in logs and blk not in rows:
+            for i in range(block_offset, block_offset+block_count):
+                if i not in logs and i not in rows:
                     continue
 
-                hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
+                hdr = struct.pack('!QQQQ', i, log_seq_num+1,
                                   int(time.time()*1000000), len(zero_block))
 
                 sha = hashlib.sha256(hdr)
                 sha.update(zero_block)
 
-                logs[block_offset+i] = [hdr, zero_block, sha.digest()]
+                logs[i] = [hdr, zero_block, sha.digest()]
 
             conn.sendall(response_header)
 
