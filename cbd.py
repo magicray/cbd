@@ -20,7 +20,7 @@ def device_init(dev, block_size, block_count, conn):
     # Network Block Device ioctl commands
     NBD_SET_SOCK = 43776
     NBD_SET_BLKSIZE = 43777
-    # NBD_SET_SIZE = 43778
+    NBD_SET_SIZE = 43778
     NBD_DO_IT = 43779
     NBD_CLEAR_SOCK = 43780
     NBD_CLEAR_QUEUE = 43781
@@ -145,7 +145,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    zero_block = lz4.block.compress(b'\x00' * block_size)
+    zero_block = lz4.block.compress(bytearray(block_size))
 
     commands = ['read', 'write', '2', 'flush', 'trim', '5', '6']
 
@@ -187,8 +187,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 block = zero_block
 
                 if i in logs:
-                    if len(logs[i][1]) > 0:
-                        block = logs[i][1]
+                    block = logs[i][1]
                 else:
                     if i in rows:
                         lsn, index, length = rows[i]
@@ -251,13 +250,24 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
         # TRIM
         if 4 == cmd:
+            rows = db.execute('''select block, lsn, offset, length from blocks
+                                 where block between ? and ?
+                              ''', [block_offset, block_offset+block_count])
+            if rows:
+                rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
+
             for i in range(block_count):
+                blk = block_offset + i
+                if blk not in logs and blk not in rows:
+                    continue
+
                 hdr = struct.pack('!QQQQ', block_offset+i, log_seq_num+1,
-                                  int(time.time()*1000000), 0)
+                                  int(time.time()*1000000), len(zero_block))
 
                 sha = hashlib.sha256(hdr)
+                sha.update(zero_block)
 
-                logs[block_offset+i] = [hdr, b'', sha.digest()]
+                logs[block_offset+i] = [hdr, zero_block, sha.digest()]
 
             conn.sendall(response_header)
 
@@ -284,12 +294,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
                 db.executemany('delete from blocks where block=?', deletes)
-                if len(logs[k][1]) > 0:
-                    db.executemany('''insert into blocks
-                                      (block,lsn,offset,length)
-                                      values(?,?,?,?)
-                                   ''', inserts)
-
+                db.executemany('''insert into blocks
+                                  (block,lsn,offset,length)
+                                  values(?,?,?,?)
+                               ''', inserts)
                 log('lsn(%d) blocks(%d) msec(%d)',
                     log_seq_num, len(logs), (time.time()-ts)*1000)
 
@@ -375,10 +383,9 @@ def main():
                     os._exit(1)
 
                 db.execute('delete from blocks where block=?', [blk])
-                if length > 0:
-                    db.execute('''insert into blocks (block,lsn,offset, length)
-                                  values(?,?,?,?)
-                               ''', [blk, logseq, i, length])
+                db.execute('''insert into blocks (block,lsn,offset, length)
+                              values(?,?,?,?)
+                           ''', [blk, logseq, i, length])
                 i += length + 64
                 j += 1
 
