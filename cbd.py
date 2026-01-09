@@ -155,7 +155,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
     zero_block = lz4.block.compress(bytearray(block_size))
 
-    # commands = ['read', 'write', '2', 'flush', 'discard', '5', '6']
+    commands = ['read', 'write', '2', 'flush', 'discard', '5', '6']
 
     fds = dict()
     logs = dict()
@@ -284,56 +284,50 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 logs[i] = [hdr, zero_block, sha.digest()]
 
             stats['discard'] += block_count
-            conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or ts - logts > 1:
-            if logs:
-                log_seq_num += 1
+        if (3 == cmd or ts - logts > 1) and logs:
+            log_seq_num += 1
 
-                i = 0
-                deletes = list()
-                inserts = list()
-                tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
-                with open(tmpfile, 'wb') as fd:
-                    for k in sorted(logs.keys()):
-                        fd.write(logs[k][0])  # header
-                        fd.write(logs[k][1])  # block
-                        fd.write(logs[k][2])  # checksum
+            i = 0
+            deletes = list()
+            inserts = list()
+            tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+            with open(tmpfile, 'wb') as fd:
+                for k in sorted(logs.keys()):
+                    fd.write(logs[k][0])  # header
+                    fd.write(logs[k][1])  # block
+                    fd.write(logs[k][2])  # checksum
 
-                        deletes.append([k])
-                        inserts.append([k, log_seq_num, i, len(logs[k][1])])
+                    deletes.append([k])
+                    inserts.append([k, log_seq_num, i, len(logs[k][1])])
 
-                        i += len(logs[k][1]) + 64
+                    i += len(logs[k][1]) + 64
 
-                os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
+            os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
-                db.executemany('delete from blocks where block=?', deletes)
-                db.executemany('''insert into blocks
-                                  (block,lsn,offset,length)
-                                  values(?,?,?,?)
-                               ''', inserts)
-                log('lsn(%d) blocks(%d) msec(%d)',
-                    log_seq_num, len(logs), (time.time()-ts)*1000)
+            db.executemany('delete from blocks where block=?', deletes)
+            db.executemany('''insert into blocks
+                              (block,lsn,offset,length)
+                              values(?,?,?,?)
+                           ''', inserts)
+            db.commit()
 
-                logs = dict()
+            log('lsn(%d) read(%d) write(%d) discard(%d) msec(%d)',
+                log_seq_num, stats['read'], stats['write'], stats['discard'],
+                (time.time()-stats['ts'])*1000)
 
-            # send response to FLUSH command
-            if 3 == cmd:
-                db.commit()
-                conn.sendall(response_header)
-
-            logts = time.time()
-
-        # log('cmd(%s) offset(%d) count(%d) msec(%d)',
-        #    commands[cmd], block_offset, block_count, (time.time()-ts)*1000)
-
-        delta = time.time() - stats['ts']
-        if delta > 1:
-            log('read(%d) write(%d) discard(%d) msec(%d)',
-                stats['read'], stats['write'], stats['discard'], delta*1000)
-
+            logs = dict()
             stats = dict(ts=time.time(), read=0, write=0, discard=0)
+
+        logts = time.time()
+
+        # send response to FLUSH or DISCARD command
+        if cmd in (3, 4):
+            conn.sendall(response_header)
+
+            log('cmd(%s) offset(%d) count(%d) msec(%d)', commands[cmd],
+                block_offset, block_count, (time.time()-ts)*1000)
 
         if cmd not in (0, 1, 3, 4):
             log('unsupported command')
