@@ -40,7 +40,7 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
-    # set options : WRITE_ZEROS(64), TRIM(32), FLUSH(4)
+    # set options : WRITE_ZEROS(64), DISCARD(32), FLUSH(4)
     fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
@@ -155,11 +155,13 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
     zero_block = lz4.block.compress(bytearray(block_size))
 
-    commands = ['read', 'write', '2', 'flush', 'trim', '5', '6']
+    # commands = ['read', 'write', '2', 'flush', 'discard', '5', '6']
 
     fds = dict()
     logs = dict()
     logts = time.time()
+
+    stats = dict(ts=time.time(), read=0, write=0, discard=0)
 
     while True:
         magic, flags, cmd, cookie, req_offset, req_length = struct.unpack(
@@ -241,25 +243,27 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 log(f'read length({req_length}) mismatch({len(octets)})')
                 os._exit(1)
 
+            stats['read'] += block_count
             conn.sendall(response_header)
             conn.sendall(octets)
 
         # WRITE
         if 1 == cmd:
             for i in range(block_offset, block_offset+block_count):
-                compressed = lz4.block.compress(recvall(conn, block_size))
+                octets = lz4.block.compress(recvall(conn, block_size))
 
                 hdr = struct.pack('!QQQQ', i, log_seq_num+1,
-                                  int(time.time()*1000000), len(compressed))
+                                  int(ts*1000000), len(octets))
 
                 sha = hashlib.sha256(hdr)
-                sha.update(compressed)
+                sha.update(octets)
 
-                logs[i] = [hdr, compressed, sha.digest()]
+                logs[i] = [hdr, octets, sha.digest()]
 
+            stats['write'] += block_count
             conn.sendall(response_header)
 
-        # TRIM
+        # DISCARD
         if 4 == cmd:
             rows = db.execute('''select block, lsn, offset, length from blocks
                                  where block between ? and ?
@@ -272,17 +276,18 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                     continue
 
                 hdr = struct.pack('!QQQQ', i, log_seq_num+1,
-                                  int(time.time()*1000000), len(zero_block))
+                                  int(ts*1000000), len(zero_block))
 
                 sha = hashlib.sha256(hdr)
                 sha.update(zero_block)
 
                 logs[i] = [hdr, zero_block, sha.digest()]
 
+            stats['discard'] += block_count
             conn.sendall(response_header)
 
         # FLUSH
-        if 3 == cmd or time.time() - logts > 1:
+        if 3 == cmd or ts - logts > 1:
             if logs:
                 log_seq_num += 1
 
@@ -320,8 +325,15 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
             logts = time.time()
 
-        log('cmd(%s) offset(%d) count(%d) msec(%d)',
-            commands[cmd], block_offset, block_count, (time.time()-ts)*1000)
+        # log('cmd(%s) offset(%d) count(%d) msec(%d)',
+        #    commands[cmd], block_offset, block_count, (time.time()-ts)*1000)
+
+        delta = time.time() - stats['ts']
+        if delta > 1:
+            log('read(%d) write(%d) discard(%d) msec(%d)',
+                stats['read'], stats['write'], stats['discard'], delta*1000)
+
+            stats = dict(ts=time.time(), read=0, write=0, discard=0)
 
         if cmd not in (0, 1, 3, 4):
             log('unsupported command')
