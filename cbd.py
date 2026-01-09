@@ -155,11 +155,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
     zero_block = lz4.block.compress(bytearray(block_size))
 
-    commands = ['read', 'write', '2', 'flush', 'discard', '5', '6']
-
     fds = dict()
     logs = dict()
-    logts = time.time()
 
     stats = dict(ts=time.time(), read=0, write=0, discard=0)
 
@@ -261,7 +258,6 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                 logs[i] = [hdr, octets, sha.digest()]
 
             stats['write'] += block_count
-            conn.sendall(response_header)
 
         # DISCARD
         if 4 == cmd:
@@ -286,7 +282,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             stats['discard'] += block_count
 
         # FLUSH
-        if (3 == cmd or ts - logts > 1) and logs:
+        if (3 == cmd and len(logs) > 0) or len(logs) > 4096:
             log_seq_num += 1
 
             i = 0
@@ -320,15 +316,14 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             logs = dict()
             stats = dict(ts=time.time(), read=0, write=0, discard=0)
 
-        logts = time.time()
-
-        # send response to FLUSH or DISCARD command
-        if cmd in (3, 4):
+        # send response to write, flush and discard command
+        if cmd in (1, 3, 4):
             conn.sendall(response_header)
 
-            log('cmd(%s) offset(%d) count(%d) msec(%d)', commands[cmd],
-                block_offset, block_count, (time.time()-ts)*1000)
+        # log('cmd(%s) offset(%d) count(%d) msec(%d)',
+        #     cmd, block_offset, block_count, (time.time()-ts)*1000)
 
+        # 0:read, 1:write, 3:flush, 4:discard
         if cmd not in (0, 1, 3, 4):
             log('unsupported command')
             os._exit(1)
