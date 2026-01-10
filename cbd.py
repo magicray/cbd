@@ -390,12 +390,6 @@ def main():
         os.rename(tmpdb, index_db)
 
     db = sqlite3.connect(index_db)
-    db.execute('''create table if not exists blocks(
-                      block  unsigned int primary key,
-                      lsn    unsigned int,
-                      offset unsigned int,
-                      length unsigned int)
-               ''')
 
     block_size = config['block_size']
     block_count = config['block_count']
@@ -429,7 +423,7 @@ def main():
                 if logseq != lsn or sha.digest() != chksum:
                     panic('corrupt logfile(%d)', lsn)
 
-                deletes.insert(blk)
+                deletes.append([blk])
                 inserts.append([blk, logseq, i, length])
 
                 i += 32 + length + 32
@@ -442,39 +436,31 @@ def main():
             db.commit()
             log('updated map(%d) blocks(%d)', lsn, j)
 
-    sha = hashlib.sha256()
-    lsn_set = list()
-    tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
-    with open(tmpfile, 'wb') as fd:
-        rows = db.execute('''select block,lsn,offset,length
-                             from blocks order by block''')
-        for blk, lsn, offset, length in rows:
-            octets = struct.pack('!QQQQ', blk, lsn, offset, length)
+    if log_seq_num > max_lsn:
+        sha = hashlib.sha256()
+        lsn_set = list()
+        tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        with open(tmpfile, 'wb') as fd:
+            rows = db.execute('''select block,lsn,offset,length
+                                 from blocks order by block''')
+            for blk, lsn, offset, length in rows:
+                octets = struct.pack('!QQQQ', blk, lsn, offset, length)
+                fd.write(octets)
+                sha.update(octets)
+                lsn_set.append(lsn)
+
+            lsn_set = set(lsn_set)
+            octets = struct.pack('!Q', max(lsn_set) if lsn_set else 0)
             fd.write(octets)
             sha.update(octets)
-            lsn_set.append(lsn)
+            fd.write(sha.digest())
 
-        lsn_set = set(lsn_set)
-        octets = struct.pack('!Q', max(lsn_set) if lsn_set else 0)
-        fd.write(octets)
-        sha.update(octets)
-        fd.write(sha.digest())
+        with open(tmpfile, 'rb') as fd:
+            s3.put('index.latest', lz4.block.compress(fd.read()))
+        os.remove(tmpfile)
+        log('uploaded new index lsn(%d)', max(lsn_set))
 
     db.close()
-
-    with open(tmpfile, 'rb') as fd:
-        s3.put('index.latest', lz4.block.compress(fd.read()))
-    os.remove(tmpfile)
-    log('index lsn(%d)', max(lsn_set) if lsn_set else 0)
-
-    for lsn in sorted(lsn_set):
-        download_lsnfile(s3, lsn)
-
-    log_file_list = [int(f) for f in os.listdir(logdir) if f.isdigit()]
-    for f in sorted(log_file_list):
-        if f not in lsn_set:
-            os.remove(os.path.join(logdir, str(f)))
-            log('deleted unused file lsn(%d)', f)
 
     # Start the backup thread
     args = (log_seq_num, logdir)
