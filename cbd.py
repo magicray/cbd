@@ -12,7 +12,14 @@ import hashlib
 import argparse
 import lz4.block
 import threading
+import traceback
 from logging import critical as log
+
+
+def panic(msg):
+    log(msg)
+    traceback.print_exc()
+    os._exit(1)
 
 
 def device_init(dev, block_size, block_count, conn):
@@ -60,6 +67,7 @@ class S3:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
         else:
             os.makedirs(os.path.join(bucket, prefix, 'log'), exist_ok=True)
+            os.makedirs(os.path.join(bucket, prefix, 'index'), exist_ok=True)
 
     def put(self, key, value):
         ts = time.time()
@@ -140,8 +148,7 @@ def recvall(conn, length):
     octets = b''.join(buf)
 
     if length != len(octets):
-        log(f'recvall length({length}) mismatch({len(octets)})')
-        os._exit(1)
+        panic(f'recvall length({length}) mismatch({len(octets)})')
 
     return octets
 
@@ -167,12 +174,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         ts = time.time()
 
         if 0x25609513 != magic:
-            log(f'invalid magic({magic}) or cmd({cmd})')
-            os._exit(1)
+            panic(f'invalid magic({magic}) or cmd({cmd})')
 
         if 0 != req_offset % block_size or 0 != req_length % block_size:
-            log(f'invalid offset({req_offset}) or length({req_length})')
-            os._exit(1)
+            panic(f'invalid offset({req_offset}) or length({req_length})')
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
@@ -222,23 +227,20 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                         chksum = octets[-32:]
 
                         if num != i or lsn != logseq:
-                            log(('corrupt block', i, num, lsn, logseq, usec))
-                            os._exit(0)
+                            panic(('corrupt block', i, num, lsn, logseq, usec))
 
                         sha = hashlib.sha256(hdr)
                         sha.update(block)
                         if sha.digest() != chksum:
                             log(block)
-                            log(('corrupt block', num, lsn, usec, chksum))
-                            os._exit(0)
+                            panic(('corrupt block', num, lsn, usec, chksum))
 
                 blocks.append(lz4.block.decompress(block))
 
             octets = b''.join(blocks)
 
             if len(octets) != req_length:
-                log(f'read length({req_length}) mismatch({len(octets)})')
-                os._exit(1)
+                panic(f'read length({req_length}) mismatch({len(octets)})')
 
             stats['read'] += block_count
             conn.sendall(response_header)
@@ -325,8 +327,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
         # 0:read, 1:write, 3:flush, 4:discard
         if cmd not in (0, 1, 3, 4):
-            log('unsupported command')
-            os._exit(1)
+            panic('unsupported command')
 
 
 def download_lsnfile(s3, lsn):
@@ -335,8 +336,7 @@ def download_lsnfile(s3, lsn):
     if not os.path.isfile(lsnfile):
         octets = s3.get(f'log/{lsn}')
         if not octets:
-            log(f'invalid lsn({lsn})')
-            os._exit(1)
+            panic(f'invalid lsn({lsn})')
 
         tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
@@ -353,6 +353,42 @@ def main():
     os.makedirs(logdir, exist_ok=True)
 
     index_db = os.path.join(ARGS.volume_dir, 'index.sqlite3')
+    if not os.path.isfile(index_db):
+        tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        with open(tmpfile, 'wb') as fd:
+            fd.write(lz4.block.decompress(s3.get('index.latest')))
+
+        tmpdb = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        db = sqlite3.connect(tmpdb)
+        db.execute('''create table if not exists blocks(
+                          block  unsigned int primary key,
+                          lsn    unsigned int,
+                          offset unsigned int,
+                          length unsigned int)
+                   ''')
+
+        filesize = os.path.getsize(tmpfile)
+        with open(tmpfile, 'rb') as fd:
+            sha = hashlib.sha256()
+            for i in range((filesize-40)//32):
+                octets = fd.read(32)
+                sha.update(octets)
+                db.execute('''insert into blocks(block,lsn,offset,length)
+                              values(?,?,?,?)
+                           ''', struct.unpack('!QQQQ', octets))
+            db.commit()
+
+            octets = fd.read(8)
+            sha.update(octets)
+            max_lsn = struct.unpack('!Q', octets)[0]
+
+            if sha.digest() != fd.read(32):
+                panic('checksum mismatch')
+
+        os.remove(tmpfile)
+        db.close()
+        os.rename(tmpdb, index_db)
+
     db = sqlite3.connect(index_db)
     db.execute('''create table if not exists blocks(
                       block  unsigned int primary key,
@@ -374,8 +410,9 @@ def main():
     for lsn in range(max_lsn+1, log_seq_num+1):
         download_lsnfile(s3, lsn)
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
-            i = 0
-            j = 0
+            i = j = 0
+            deletes = list()
+            inserts = list()
             while True:
                 hdr = fd.read(32)
                 if not hdr:
@@ -390,22 +427,48 @@ def main():
                 sha.update(block)
 
                 if logseq != lsn or sha.digest() != chksum:
-                    log('corrupt logfile(%d)', lsn)
-                    os._exit(1)
+                    panic('corrupt logfile(%d)', lsn)
 
-                db.execute('delete from blocks where block=?', [blk])
-                db.execute('''insert into blocks (block,lsn,offset, length)
-                              values(?,?,?,?)
-                           ''', [blk, logseq, i, length])
-                i += length + 64
+                deletes.insert(blk)
+                inserts.append([blk, logseq, i, length])
+
+                i += 32 + length + 32
                 j += 1
 
+            db.executemany('delete from blocks where block=?', deletes)
+            db.executemany('''insert into blocks (block,lsn,offset,length)
+                              values(?,?,?,?)
+                           ''', inserts)
             db.commit()
             log('updated map(%d) blocks(%d)', lsn, j)
 
-    rows = db.execute('select distinct lsn from blocks').fetchall()
-    lsn_set = set([r[0] for r in rows])
+    sha = hashlib.sha256()
+    lsn_set = list()
+    tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+    with open(tmpfile, 'wb') as fd:
+        rows = db.execute('''select block,lsn,offset,length
+                             from blocks order by block''')
+        for blk, lsn, offset, length in rows:
+            octets = struct.pack('!QQQQ', blk, lsn, offset, length)
+            fd.write(octets)
+            sha.update(octets)
+            lsn_set.append(lsn)
+
+        lsn_set = set(lsn_set)
+        octets = struct.pack('!Q', max(lsn_set) if lsn_set else 0)
+        fd.write(octets)
+        sha.update(octets)
+        fd.write(sha.digest())
+
     db.close()
+
+    with open(tmpfile, 'rb') as fd:
+        s3.put('index.latest', lz4.block.compress(fd.read()))
+    os.remove(tmpfile)
+    log('index lsn(%d)', max(lsn_set) if lsn_set else 0)
+
+    for lsn in sorted(lsn_set):
+        download_lsnfile(s3, lsn)
 
     log_file_list = [int(f) for f in os.listdir(logdir) if f.isdigit()]
     for f in sorted(log_file_list):
@@ -473,6 +536,11 @@ if __name__ == '__main__':
             block_count=ARGS.block_count)).encode())
         s3.put('tail.json', json.dumps(dict(lsn=0)).encode())
 
+        octets = struct.pack('!Q', 0)
+        sha = hashlib.sha256(octets).digest()
+        s3.put('index.latest', lz4.block.compress(octets + sha))
+
         log('Device initialized')
         log(json.loads(s3.get('tail.json').decode()))
         log(json.loads(s3.get('config.json').decode()))
+        log(len(s3.get('index.latest')))
