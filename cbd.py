@@ -81,7 +81,7 @@ class S3:
                 fd.write(value)
             os.rename(tmpfile, os.path.join(self.bucket, key))
 
-        log('bucket(%s/%s) put(%s) length(%d) msec(%d)',
+        log('put(%s/%s/%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(value),
             (time.time()-ts) * 1000)
 
@@ -104,7 +104,7 @@ class S3:
             else:
                 octets = ''
 
-        log('bucket(%s/%s) get(%s) length(%d) msec(%d)',
+        log('get(%s/%s/%s) length(%d) msec(%d)',
             self.endpoint, self.bucket, key, len(octets),
             (time.time()-ts) * 1000)
 
@@ -112,7 +112,7 @@ class S3:
 
 
 def backup(log_seq_num, logdir):
-    s3 = S3(ARGS.bucket, ARGS.namespace)
+    s3 = S3(ARGS.bucket, ARGS.prefix)
 
     while True:
         lsn = log_seq_num + 1
@@ -155,7 +155,7 @@ def recvall(conn, length):
 
 def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     db = sqlite3.connect(db)
-    s3 = S3(ARGS.bucket, ARGS.namespace)
+    s3 = S3(ARGS.bucket, ARGS.prefix)
 
     conn, peer = sock.accept()
     log('client connection accepted')
@@ -298,7 +298,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             i = 0
             deletes = list()
             inserts = list()
-            tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
+            tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
             with open(tmpfile, 'wb') as fd:
                 for k in sorted(logs.keys()):
                     fd.write(logs[k][0])  # header   - 32 bytes
@@ -343,7 +343,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
 
 def download_lsnfile(s3, lsn):
-    lsnfile = os.path.join(ARGS.datadir, 'log', str(lsn))
+    lsnfile = os.path.join(ARGS.datadir, ARGS.prefix, 'log', str(lsn))
 
     # download only if the file is not already downloaded
     if not os.path.isfile(lsnfile):
@@ -352,29 +352,29 @@ def download_lsnfile(s3, lsn):
             panic(f'invalid lsn({lsn})')
 
         # write data to a tmp file and then atomically rename
-        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             fd.write(octets)
         os.rename(tmpfile, lsnfile)
 
 
 def main():
-    s3 = S3(ARGS.bucket, ARGS.namespace)
+    s3 = S3(ARGS.bucket, ARGS.prefix)
     config = json.loads(s3.get('config.json').decode())
     log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
 
-    logdir = os.path.join(ARGS.datadir, 'log')
+    logdir = os.path.join(ARGS.datadir, ARGS.prefix, 'log')
+    index_db = os.path.join(ARGS.datadir, ARGS.prefix, 'index.sqlite3')
     os.makedirs(logdir, exist_ok=True)
-
-    index_db = os.path.join(ARGS.datadir, 'index.sqlite3')
 
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
-        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
+        tmpdb = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
+
         with open(tmpfile, 'wb') as fd:
             fd.write(lz4.block.decompress(s3.get('index.latest')))
 
-        tmpdb = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         db = sqlite3.connect(tmpdb)
         db.execute('''create table if not exists blocks(
                           block  unsigned int primary key,
@@ -383,10 +383,12 @@ def main():
                           length unsigned int)
                    ''')
 
-        filesize = os.path.getsize(tmpfile)
         with open(tmpfile, 'rb') as fd:
             sha = hashlib.sha256()
-            for i in range((filesize-40)//32):
+
+            # each record          - 32 bytes
+            # trailer (lsn+chksum) - 40 bytes
+            for i in range((os.path.getsize(tmpfile)-40)//32):
                 octets = fd.read(32)
                 sha.update(octets)
                 db.execute('''insert into blocks(block,lsn,offset,length)
@@ -394,9 +396,7 @@ def main():
                            ''', struct.unpack('!QQQQ', octets))
             db.commit()
 
-            octets = fd.read(8)
-            sha.update(octets)
-            max_lsn = struct.unpack('!Q', octets)[0]
+            sha.update(fd.read(8))
 
             if sha.digest() != fd.read(32):
                 panic('checksum mismatch')
@@ -418,10 +418,13 @@ def main():
     # update the index db with the latest log files
     for lsn in range(max_lsn+1, log_seq_num+1):
         download_lsnfile(s3, lsn)
+
+        i = j = 0
+        deletes = list()
+        inserts = list()
+
+        # read each record and verify checksum
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
-            i = j = 0
-            deletes = list()
-            inserts = list()
             while True:
                 hdr = fd.read(32)
                 if not hdr:
@@ -429,56 +432,60 @@ def main():
 
                 blk, logseq, usec, length = struct.unpack('!QQQQ', hdr)
 
-                block = fd.read(length)
-                chksum = fd.read(32)
-
                 sha = hashlib.sha256(hdr)
-                sha.update(block)
+                sha.update(fd.read(length))
 
-                if logseq != lsn or sha.digest() != chksum:
+                if logseq != lsn or sha.digest() != fd.read(32):
                     panic('corrupt logfile(%d)', lsn)
 
                 deletes.append([blk])
                 inserts.append([blk, logseq, i, length])
 
-                i += 32 + length + 32
-                j += 1
+                i += 32 + length + 32  # move the offset to next record
+                j += 1                 # block counter
 
-            db.executemany('delete from blocks where block=?', deletes)
-            db.executemany('''insert into blocks (block,lsn,offset,length)
-                              values(?,?,?,?)
-                           ''', inserts)
-            db.commit()
-            log('updated map(%d) blocks(%d)', lsn, j)
+        # all records are consisent, update the index
+        db.executemany('delete from blocks where block=?', deletes)
+        db.executemany('''insert into blocks (block,lsn,offset,length)
+                          values(?,?,?,?)
+                       ''', inserts)
+        db.commit()
+        log('updated map(%d) blocks(%d)', lsn, j)
 
     # upload the updated index db to the object store
     if log_seq_num > max_lsn:
         sha = hashlib.sha256()
-        lsn_set = list()
-        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
 
         # read the blocks table and write it to a tmp file
         # write the max lsn and sha256 checksum at the end
+        max_lsn = 0
         with open(tmpfile, 'wb') as fd:
             rows = db.execute('''select block,lsn,offset,length
                                  from blocks order by block''')
+
             for blk, lsn, offset, length in rows:
                 octets = struct.pack('!QQQQ', blk, lsn, offset, length)
-                fd.write(octets)
                 sha.update(octets)
-                lsn_set.append(lsn)
+                fd.write(octets)
 
-            lsn_set = set(lsn_set)
-            octets = struct.pack('!Q', max(lsn_set) if lsn_set else 0)
-            fd.write(octets)
+                max_lsn = max(max_lsn, lsn)
+
+            octets = struct.pack('!Q', max_lsn)
             sha.update(octets)
+            fd.write(octets)
+
             fd.write(sha.digest())
+
+        if max_lsn != log_seq_num:
+            panic('index db could not be correctly updated')
 
         # compress and upload the file
         with open(tmpfile, 'rb') as fd:
             s3.put('index.latest', lz4.block.compress(fd.read()))
         os.remove(tmpfile)
-        log('uploaded new index lsn(%d)', max(lsn_set))
+
+        log('uploaded new index lsn(%d)', max_lsn)
 
     db.close()
 
@@ -516,11 +523,8 @@ if __name__ == '__main__':
     ARGS.add_argument('--bucket',
                       default='https://s3.us-east-005.backblazeb2.com/bucket',
                       help='object store')
-
-    ARGS.add_argument('--namespace', default='namespace',
-                      help='Object store file path prefix')
-
-    ARGS.add_argument('--datadir', default='data', help='local write area')
+    ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
+    ARGS.add_argument('--datadir', default='datadir', help='local write area')
 
     ARGS.add_argument('--device', default='/dev/nbd0', help='device path')
     ARGS.add_argument('--block_size', type=int, help='device block size')
@@ -531,7 +535,7 @@ if __name__ == '__main__':
     if ARGS.block_size is None and ARGS.block_count is None:
         main()
     else:
-        s3 = S3(ARGS.bucket, ARGS.namespace)
+        s3 = S3(ARGS.bucket, ARGS.prefix)
         s3.put('config.json', json.dumps(dict(
             block_size=ARGS.block_size,
             block_count=ARGS.block_count)).encode())
