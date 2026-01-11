@@ -419,6 +419,9 @@ def main():
         db.commit()
         log('updated map(%d) blocks(%d)', lsn, j)
 
+    row = db.execute('''select count(distinct block), count(distinct lsn)
+                        from blocks''').fetchone()
+    log('total_blocks(%d) total_files(%d)', row[0], row[1])
     db.close()
 
     # upload the updated index db to the object store
