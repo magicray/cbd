@@ -363,6 +363,9 @@ def main():
     config = json.loads(s3.get('config.json').decode())
     log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
 
+    logdir = os.path.join(ARGS.datadir, 'log')
+    os.makedirs(logdir, exist_ok=True)
+
     index_db = os.path.join(ARGS.datadir, 'index.sqlite3')
 
     # download the index db if it is not already present
@@ -411,9 +414,6 @@ def main():
         max_lsn = 0
 
     log('log_seq_num(%d) max_lsn(%d)', log_seq_num, max_lsn)
-
-    logdir = os.path.join(ARGS.datadir, 'log')
-    os.makedirs(logdir, exist_ok=True)
 
     # update the index db with the latest log files
     for lsn in range(max_lsn+1, log_seq_num+1):
