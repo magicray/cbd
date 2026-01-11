@@ -369,43 +369,10 @@ def main():
 
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
-        tmpdb = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
         tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
-
         with open(tmpfile, 'wb') as fd:
             fd.write(lz4.block.decompress(s3.get('index.latest')))
-
-        db = sqlite3.connect(tmpdb)
-        db.execute('''create table if not exists blocks(
-                          block  unsigned int primary key,
-                          lsn    unsigned int,
-                          offset unsigned int,
-                          length unsigned int)
-                   ''')
-
-        with open(tmpfile, 'rb') as fd:
-            sha = hashlib.sha256()
-
-            # each record          - 32 bytes
-            # trailer (lsn+chksum) - 40 bytes
-            for i in range((os.path.getsize(tmpfile)-40)//32):
-                octets = fd.read(32)
-                sha.update(octets)
-                db.execute('''insert into blocks(block,lsn,offset,length)
-                              values(?,?,?,?)
-                           ''', struct.unpack('!QQQQ', octets))
-            db.commit()
-
-            sha.update(fd.read(8))
-
-            if sha.digest() != fd.read(32):
-                panic('checksum mismatch')
-
-        os.remove(tmpfile)
-        db.close()
-
-        # all good. index db is complete and consistent.
-        os.rename(tmpdb, index_db)
+        os.rename(tmpfile, index_db)
 
     db = sqlite3.connect(index_db)
 
@@ -452,42 +419,13 @@ def main():
         db.commit()
         log('updated map(%d) blocks(%d)', lsn, j)
 
+    db.close()
+
     # upload the updated index db to the object store
     if log_seq_num > max_lsn:
-        sha = hashlib.sha256()
-        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
-
-        # read the blocks table and write it to a tmp file
-        # write the max lsn and sha256 checksum at the end
-        max_lsn = 0
-        with open(tmpfile, 'wb') as fd:
-            rows = db.execute('''select block,lsn,offset,length
-                                 from blocks order by block''')
-
-            for blk, lsn, offset, length in rows:
-                octets = struct.pack('!QQQQ', blk, lsn, offset, length)
-                sha.update(octets)
-                fd.write(octets)
-
-                max_lsn = max(max_lsn, lsn)
-
-            octets = struct.pack('!Q', max_lsn)
-            sha.update(octets)
-            fd.write(octets)
-
-            fd.write(sha.digest())
-
-        if max_lsn != log_seq_num:
-            panic('index db could not be correctly updated')
-
-        # compress and upload the file
-        with open(tmpfile, 'rb') as fd:
+        with open(index_db, 'rb') as fd:
             s3.put('index.latest', lz4.block.compress(fd.read()))
-        os.remove(tmpfile)
-
-        log('uploaded new index lsn(%d)', max_lsn)
-
-    db.close()
+        log('uploaded new index lsn(%d)', log_seq_num)
 
     # Start the backup thread
     args = (log_seq_num, logdir)
@@ -541,9 +479,19 @@ if __name__ == '__main__':
             block_count=ARGS.block_count)).encode())
         s3.put('tail.json', json.dumps(dict(lsn=0)).encode())
 
-        octets = struct.pack('!Q', 0)
-        sha = hashlib.sha256(octets).digest()
-        s3.put('index.latest', lz4.block.compress(octets + sha))
+        tmpdb = os.path.join('/tmp', uuid.uuid4().hex)
+        db = sqlite3.connect(tmpdb)
+        db.execute('''create table if not exists blocks(
+                          block  unsigned int primary key,
+                          lsn    unsigned int,
+                          offset unsigned int,
+                          length unsigned int)
+                   ''')
+        db.close()
+
+        with open(tmpdb, 'rb') as fd:
+            s3.put('index.latest', lz4.block.compress(fd.read()))
+        os.remove(tmpdb)
 
         log('Store initialized')
         log(json.loads(s3.get('tail.json').decode()))
