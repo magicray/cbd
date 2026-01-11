@@ -359,12 +359,13 @@ def download_lsnfile(s3, lsn):
 
 
 def main():
-    logdir = os.path.join(ARGS.datadir, 'log')
-    os.makedirs(logdir, exist_ok=True)
-
     s3 = S3(ARGS.bucket, ARGS.namespace)
+    config = json.loads(s3.get('config.json').decode())
+    log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
 
     index_db = os.path.join(ARGS.datadir, 'index.sqlite3')
+
+    # download the index db if it is not already present
     if not os.path.isfile(index_db):
         tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
@@ -399,10 +400,9 @@ def main():
 
         os.remove(tmpfile)
         db.close()
-        os.rename(tmpdb, index_db)
 
-    config = json.loads(s3.get('config.json').decode())
-    log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
+        # all good. index db is complete and consistent.
+        os.rename(tmpdb, index_db)
 
     db = sqlite3.connect(index_db)
 
@@ -412,6 +412,10 @@ def main():
 
     log('log_seq_num(%d) max_lsn(%d)', log_seq_num, max_lsn)
 
+    logdir = os.path.join(ARGS.datadir, 'log')
+    os.makedirs(logdir, exist_ok=True)
+
+    # update the index db with the latest log files
     for lsn in range(max_lsn+1, log_seq_num+1):
         download_lsnfile(s3, lsn)
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
@@ -447,10 +451,14 @@ def main():
             db.commit()
             log('updated map(%d) blocks(%d)', lsn, j)
 
+    # upload the updated index db to the object store
     if log_seq_num > max_lsn:
         sha = hashlib.sha256()
         lsn_set = list()
         tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
+
+        # read the blocks table and write it to a tmp file
+        # write the max lsn and sha256 checksum at the end
         with open(tmpfile, 'wb') as fd:
             rows = db.execute('''select block,lsn,offset,length
                                  from blocks order by block''')
@@ -466,6 +474,7 @@ def main():
             sha.update(octets)
             fd.write(sha.digest())
 
+        # compress and upload the file
         with open(tmpfile, 'rb') as fd:
             s3.put('index.latest', lz4.block.compress(fd.read()))
         os.remove(tmpfile)
