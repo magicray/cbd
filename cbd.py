@@ -58,10 +58,10 @@ def device_init(dev, block_size, block_count, conn):
 
 
 class S3:
-    def __init__(self, endpoint, bucket, prefix):
+    def __init__(self, bucket, prefix):
         self.prefix = prefix
-        self.bucket = bucket
-        self.endpoint = endpoint
+        self.bucket = bucket.split('/')[-1]
+        self.endpoint = '/'.join(bucket.split('/')[:-1])
 
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
@@ -112,7 +112,7 @@ class S3:
 
 
 def backup(log_seq_num, logdir):
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
+    s3 = S3(ARGS.bucket, ARGS.namespace)
 
     while True:
         lsn = log_seq_num + 1
@@ -135,7 +135,7 @@ def recvall(conn, length):
     buf = list()
 
     remaining = length
-    while remaining:
+    while remaining > 0:
         octets = conn.recv(length)
 
         if not octets:
@@ -155,12 +155,12 @@ def recvall(conn, length):
 
 def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     db = sqlite3.connect(db)
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
+    s3 = S3(ARGS.bucket, ARGS.namespace)
 
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    zero_block = lz4.block.compress(bytearray(block_size))
+    zeroed_block = lz4.block.compress(bytearray(block_size))
 
     fds = dict()
     logs = dict()
@@ -189,54 +189,56 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         if 0 == cmd:
             blocks = list()
 
+            # read log file number and offset for block_count blocks
             rows = db.execute('''select block, lsn, offset, length from blocks
                                  where block between ? and ?
-                              ''', [block_offset, block_offset+block_count])
+                              ''', [block_offset, block_offset+block_count-1])
             if rows:
+                # key -> block number
+                # value -> log file number, offset into log file, length
                 rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
 
             for i in range(block_offset, block_offset+block_count):
-                block = zero_block
-
+                # latest value is not yet written to the log
                 if i in logs:
                     block = logs[i][1]
-                else:
-                    if i in rows:
-                        lsn, index, length = rows[i]
-                    else:
-                        lsn, index, length = 0, 0, 0
 
-                    if lsn:
-                        download_lsnfile(s3, lsn)
+                # this block found in some log file
+                elif i in rows:
+                    lsn, index, length = rows[i]
+
+                    # if already present, this function would do nothing
+                    download_lsnfile(s3, lsn)
 
                     lsn_file = os.path.join(logdir, str(lsn))
-                    if os.path.isfile(lsn_file):
-                        if lsn_file not in fds:
-                            fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
+                    if lsn_file not in fds:
+                        fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
 
-                        octets = os.pread(fds[lsn_file], length+64, index)
+                    octets = os.pread(fds[lsn_file], 32+length+32, index)
 
-                        # header : block_index, lsn, usec_timestamp, length
-                        hdr = octets[:32]
-                        num, logseq, usec, length = struct.unpack('!QQQQ', hdr)
+                    hdr = octets[:32]       # header
+                    block = octets[32:-32]  # actual block content - compressed
+                    chksum = octets[-32:]   # checksum - sha256
 
-                        # this is the actual data
-                        block = octets[32:-32]
+                    # header : block_index, lsn, usec_timestamp, length
+                    num, logseq, usec, length = struct.unpack('!QQQQ', hdr)
 
-                        # checksum - sha256
-                        chksum = octets[-32:]
+                    if num != i or lsn != logseq:
+                        panic(('corrupt block', i, num, lsn, logseq, usec))
 
-                        if num != i or lsn != logseq:
-                            panic(('corrupt block', i, num, lsn, logseq, usec))
+                    sha = hashlib.sha256(hdr)
+                    sha.update(block)
+                    if sha.digest() != chksum:
+                        log(block)
+                        panic(('corrupt block', num, lsn, usec, chksum))
 
-                        sha = hashlib.sha256(hdr)
-                        sha.update(block)
-                        if sha.digest() != chksum:
-                            log(block)
-                            panic(('corrupt block', num, lsn, usec, chksum))
+                # this block was never written
+                else:
+                    block = zeroed_block
 
                 blocks.append(lz4.block.decompress(block))
 
+            # concatenate all the block to get the response data
             octets = b''.join(blocks)
 
             if len(octets) != req_length:
@@ -249,37 +251,43 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         # WRITE
         if 1 == cmd:
             for i in range(block_offset, block_offset+block_count):
+                # read the block from the socket and compress it
                 octets = lz4.block.compress(recvall(conn, block_size))
 
+                # header : block_index, lsn, usec_timestamp, length
                 hdr = struct.pack('!QQQQ', i, log_seq_num+1,
                                   int(ts*1000000), len(octets))
 
                 sha = hashlib.sha256(hdr)
                 sha.update(octets)
 
+                # retain data in memory till it is written to the log
                 logs[i] = [hdr, octets, sha.digest()]
 
             stats['write'] += block_count
 
         # DISCARD
         if 4 == cmd:
+            # we need to check if the block is already written
+            # if yes, we must overwrite it. If no, we can just ignore as
+            # we anyway return zeroed block for reads of non existent blocks
             rows = db.execute('''select block, lsn, offset, length from blocks
                                  where block between ? and ?
-                              ''', [block_offset, block_offset+block_count])
+                              ''', [block_offset, block_offset+block_count-1])
             if rows:
                 rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
 
             for i in range(block_offset, block_offset+block_count):
-                if i not in logs and i not in rows:
-                    continue
+                if i in logs or i in rows:
+                    # if this block is already written, overwrite with a
+                    # zeroed block. ignore otherwise
+                    hdr = struct.pack('!QQQQ', i, log_seq_num+1,
+                                      int(ts*1000000), len(zeroed_block))
 
-                hdr = struct.pack('!QQQQ', i, log_seq_num+1,
-                                  int(ts*1000000), len(zero_block))
+                    sha = hashlib.sha256(hdr)
+                    sha.update(zeroed_block)
 
-                sha = hashlib.sha256(hdr)
-                sha.update(zero_block)
-
-                logs[i] = [hdr, zero_block, sha.digest()]
+                    logs[i] = [hdr, zeroed_block, sha.digest()]
 
             stats['discard'] += block_count
 
@@ -290,20 +298,24 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             i = 0
             deletes = list()
             inserts = list()
-            tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+            tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
             with open(tmpfile, 'wb') as fd:
                 for k in sorted(logs.keys()):
-                    fd.write(logs[k][0])  # header
-                    fd.write(logs[k][1])  # block
-                    fd.write(logs[k][2])  # checksum
+                    fd.write(logs[k][0])  # header   - 32 bytes
+                    fd.write(logs[k][1])  # block    - compressed block_size
+                    fd.write(logs[k][2])  # checksum - 32 bytes
 
+                    # delete the existing row and insert the new value
                     deletes.append([k])
                     inserts.append([k, log_seq_num, i, len(logs[k][1])])
 
-                    i += len(logs[k][1]) + 64
+                    # update the offset into the log file number log_seq_num
+                    i += 32 + len(logs[k][1]) + 32
 
+            # atomically rename the tmp file now, avoiding half written files
             os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
+            # update the index database
             db.executemany('delete from blocks where block=?', deletes)
             db.executemany('''insert into blocks
                               (block,lsn,offset,length)
@@ -331,34 +343,34 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
 
 def download_lsnfile(s3, lsn):
-    lsnfile = os.path.join(ARGS.volume_dir, 'log', str(lsn))
+    lsnfile = os.path.join(ARGS.datadir, 'log', str(lsn))
 
+    # download only if the file is not already downloaded
     if not os.path.isfile(lsnfile):
         octets = s3.get(f'log/{lsn}')
         if not octets:
             panic(f'invalid lsn({lsn})')
 
-        tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        # write data to a tmp file and then atomically rename
+        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             fd.write(octets)
         os.rename(tmpfile, lsnfile)
 
 
 def main():
-    s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
-    tail = json.loads(s3.get('tail.json').decode())
-    config = json.loads(s3.get('config.json').decode())
-
-    logdir = os.path.join(ARGS.volume_dir, 'log')
+    logdir = os.path.join(ARGS.datadir, 'log')
     os.makedirs(logdir, exist_ok=True)
 
-    index_db = os.path.join(ARGS.volume_dir, 'index.sqlite3')
+    s3 = S3(ARGS.bucket, ARGS.namespace)
+
+    index_db = os.path.join(ARGS.datadir, 'index.sqlite3')
     if not os.path.isfile(index_db):
-        tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             fd.write(lz4.block.decompress(s3.get('index.latest')))
 
-        tmpdb = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        tmpdb = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         db = sqlite3.connect(tmpdb)
         db.execute('''create table if not exists blocks(
                           block  unsigned int primary key,
@@ -389,11 +401,10 @@ def main():
         db.close()
         os.rename(tmpdb, index_db)
 
-    db = sqlite3.connect(index_db)
+    config = json.loads(s3.get('config.json').decode())
+    log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
 
-    block_size = config['block_size']
-    block_count = config['block_count']
-    log_seq_num = tail['lsn']
+    db = sqlite3.connect(index_db)
 
     max_lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
     if max_lsn is None:
@@ -439,7 +450,7 @@ def main():
     if log_seq_num > max_lsn:
         sha = hashlib.sha256()
         lsn_set = list()
-        tmpfile = os.path.join(ARGS.volume_dir, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.datadir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             rows = db.execute('''select block,lsn,offset,length
                                  from blocks order by block''')
@@ -474,7 +485,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, block_size, block_count,
+    args = (server_sock, config['block_size'], config['block_count'],
             logdir, log_seq_num, index_db)
     threading.Thread(target=server, args=args).start()
 
@@ -484,7 +495,8 @@ def main():
     os.remove(sock_path)
 
     # Initialize the device, attach the client socket created above
-    device_init(ARGS.device, block_size, block_count, client_sock.fileno())
+    device_init(ARGS.device, config['block_size'], config['block_count'],
+                client_sock.fileno())
 
 
 if __name__ == '__main__':
@@ -492,31 +504,25 @@ if __name__ == '__main__':
 
     ARGS = argparse.ArgumentParser()
 
-    ARGS.add_argument('--s3endpoint',
-                      default='https://s3.us-east-005.backblazeb2.com',
-                      help='S3 object store endpoint')
+    ARGS.add_argument('--bucket',
+                      default='https://s3.us-east-005.backblazeb2.com/bucket',
+                      help='object store')
 
-    ARGS.add_argument('--s3bucket', default='cloudblockdevice',
-                      help='S3 bucket')
+    ARGS.add_argument('--namespace', default='namespace',
+                      help='Object store file path prefix')
 
-    ARGS.add_argument('--s3prefix', default='volume',
-                      help='S3 prefix for namespace')
+    ARGS.add_argument('--datadir', default='data', help='local write area')
 
-    ARGS.add_argument('--device', default='/dev/nbd0',
-                      help='Network Block Device path')
-
-    ARGS.add_argument('--volume_dir', default='volume',
-                      help='volume write area')
-
-    ARGS.add_argument('--block_size', type=int, help='Device block size')
-    ARGS.add_argument('--block_count', type=int, help='Device block count')
+    ARGS.add_argument('--device', default='/dev/nbd0', help='device path')
+    ARGS.add_argument('--block_size', type=int, help='device block size')
+    ARGS.add_argument('--block_count', type=int, help='device block count')
 
     ARGS = ARGS.parse_args()
 
     if ARGS.block_size is None and ARGS.block_count is None:
         main()
     else:
-        s3 = S3(ARGS.s3endpoint, ARGS.s3bucket, ARGS.s3prefix)
+        s3 = S3(ARGS.bucket, ARGS.namespace)
         s3.put('config.json', json.dumps(dict(
             block_size=ARGS.block_size,
             block_count=ARGS.block_count)).encode())
@@ -526,7 +532,7 @@ if __name__ == '__main__':
         sha = hashlib.sha256(octets).digest()
         s3.put('index.latest', lz4.block.compress(octets + sha))
 
-        log('Device initialized')
+        log('Store initialized')
         log(json.loads(s3.get('tail.json').decode()))
         log(json.loads(s3.get('config.json').decode()))
         log(len(s3.get('index.latest')))
