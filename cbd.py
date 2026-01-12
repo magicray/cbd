@@ -47,8 +47,8 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
 
-    # set options : WRITE_ZEROS(64), DISCARD(32), FLUSH(4)
-    fcntl.ioctl(fd, NBD_SET_FLAGS, 64+32+4+1)
+    # set options : FLUSH(4)
+    fcntl.ioctl(fd, NBD_SET_FLAGS, 4+1)
 
     log('initialized(%s) block_size(%d) block_count(%d)',
         dev, block_size, block_count)
@@ -165,7 +165,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
     fds = dict()
     logs = dict()
 
-    stats = dict(ts=time.time(), read=0, write=0, discard=0)
+    stats = dict(ts=time.time(), read=0, write=0)
 
     while True:
         magic, flags, cmd, cookie, req_offset, req_length = struct.unpack(
@@ -266,31 +266,6 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
             stats['write'] += block_count
 
-        # DISCARD
-        if 4 == cmd:
-            # we need to check if the block is already written
-            # if yes, we must overwrite it. If no, we can just ignore as
-            # we anyway return zeroed block for reads of non existent blocks
-            rows = db.execute('''select block, lsn, offset, length from blocks
-                                 where block between ? and ?
-                              ''', [block_offset, block_offset+block_count-1])
-            if rows:
-                rows = {r[0]: (r[1], r[2], r[3]) for r in rows.fetchall()}
-
-            for i in range(block_offset, block_offset+block_count):
-                if i in logs or i in rows:
-                    # if this block is already written, overwrite with a
-                    # zeroed block. ignore otherwise
-                    hdr = struct.pack('!QQQQ', i, log_seq_num+1,
-                                      int(ts*1000000), len(zeroed_block))
-
-                    sha = hashlib.sha256(hdr)
-                    sha.update(zeroed_block)
-
-                    logs[i] = [hdr, zeroed_block, sha.digest()]
-
-            stats['discard'] += block_count
-
         # FLUSH
         if (3 == cmd and len(logs) > 0) or len(logs) > 4096:
             log_seq_num += 1
@@ -323,22 +298,22 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                            ''', inserts)
             db.commit()
 
-            log('lsn(%d) read(%d) write(%d) discard(%d) msec(%d)',
-                log_seq_num, stats['read'], stats['write'], stats['discard'],
+            log('lsn(%d) read(%d) write(%d) msec(%d)',
+                log_seq_num, stats['read'], stats['write'],
                 (time.time()-stats['ts'])*1000)
 
             logs = dict()
-            stats = dict(ts=time.time(), read=0, write=0, discard=0)
+            stats = dict(ts=time.time(), read=0, write=0)
 
         # send response to write, flush and discard command
-        if cmd in (1, 3, 4):
+        if cmd in (1, 3):
             conn.sendall(response_header)
 
         # log('cmd(%s) offset(%d) count(%d) msec(%d)',
         #     cmd, block_offset, block_count, (time.time()-ts)*1000)
 
-        # 0:read, 1:write, 3:flush, 4:discard
-        if cmd not in (0, 1, 3, 4):
+        # 0:read, 1:write, 3:flush
+        if cmd not in (0, 1, 3):
             panic('unsupported command')
 
 
@@ -359,8 +334,8 @@ def download_lsnfile(s3, lsn):
 
 
 def main():
+    block_size, block_count = 4096, 2**31-1
     s3 = S3(ARGS.bucket, ARGS.prefix)
-    config = json.loads(s3.get('config.json').decode())
     log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
 
     logdir = os.path.join(ARGS.datadir, ARGS.prefix, 'log')
@@ -425,10 +400,9 @@ def main():
     db.close()
 
     # upload the updated index db to the object store
-    if log_seq_num > max_lsn:
-        with open(index_db, 'rb') as fd:
-            s3.put('index.latest', lz4.block.compress(fd.read()))
-        log('uploaded new index lsn(%d)', log_seq_num)
+    with open(index_db, 'rb') as fd:
+        s3.put('index.latest', lz4.block.compress(fd.read()))
+    log('uploaded new index lsn(%d)', log_seq_num)
 
     # Start the backup thread
     args = (log_seq_num, logdir)
@@ -442,7 +416,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, config['block_size'], config['block_count'],
+    args = (server_sock, block_size, block_count,
             logdir, log_seq_num, index_db)
     threading.Thread(target=server, args=args).start()
 
@@ -452,8 +426,7 @@ def main():
     os.remove(sock_path)
 
     # Initialize the device, attach the client socket created above
-    device_init(ARGS.device, config['block_size'], config['block_count'],
-                client_sock.fileno())
+    device_init(ARGS.device, block_size, block_count, client_sock.fileno())
 
 
 if __name__ == '__main__':
@@ -461,25 +434,20 @@ if __name__ == '__main__':
 
     ARGS = argparse.ArgumentParser()
 
+    ARGS.add_argument('--device', help='device path')
+
+    ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
+    ARGS.add_argument('--datadir', default='datadir', help='local write area')
     ARGS.add_argument('--bucket',
                       default='https://s3.us-east-005.backblazeb2.com/bucket',
                       help='object store')
-    ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
-    ARGS.add_argument('--datadir', default='datadir', help='local write area')
-
-    ARGS.add_argument('--device', default='/dev/nbd0', help='device path')
-    ARGS.add_argument('--block_size', type=int, help='device block size')
-    ARGS.add_argument('--block_count', type=int, help='device block count')
 
     ARGS = ARGS.parse_args()
 
-    if ARGS.block_size is None and ARGS.block_count is None:
+    if ARGS.device:
         main()
     else:
         s3 = S3(ARGS.bucket, ARGS.prefix)
-        s3.put('config.json', json.dumps(dict(
-            block_size=ARGS.block_size,
-            block_count=ARGS.block_count)).encode())
         s3.put('tail.json', json.dumps(dict(lsn=0)).encode())
 
         tmpdb = os.path.join('/tmp', uuid.uuid4().hex)
@@ -498,5 +466,4 @@ if __name__ == '__main__':
 
         log('Store initialized')
         log(json.loads(s3.get('tail.json').decode()))
-        log(json.loads(s3.get('config.json').decode()))
         log(len(s3.get('index.latest')))
