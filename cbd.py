@@ -67,7 +67,7 @@ class S3:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
         else:
             os.makedirs(os.path.join(bucket, prefix, 'log'), exist_ok=True)
-            os.makedirs(os.path.join(bucket, prefix, 'index'), exist_ok=True)
+            os.makedirs(os.path.join(bucket, prefix, 'snapshots'), exist_ok=True)
 
     def put(self, key, value):
         ts = time.time()
@@ -344,9 +344,11 @@ def main():
 
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
+        snapshots = json.loads(s3.get('snapshots.json').decode())
+        latest = max([int(k) for k in snapshots.keys()])
         tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
-            fd.write(lz4.block.decompress(s3.get('index.latest')))
+            fd.write(lz4.block.decompress(s3.get(f'snapshots/{latest}')))
         os.rename(tmpfile, index_db)
 
     db = sqlite3.connect(index_db)
@@ -400,9 +402,15 @@ def main():
     db.close()
 
     # upload the updated index db to the object store
-    with open(index_db, 'rb') as fd:
-        s3.put('index.latest', lz4.block.compress(fd.read()))
-    log('uploaded new index lsn(%d)', log_seq_num)
+    snapshots = json.loads(s3.get('snapshots.json').decode())
+    if str(log_seq_num) not in snapshots:
+        with open(index_db, 'rb') as fd:
+            octets = lz4.block.compress(fd.read())
+        s3.put(f'snapshots/{log_seq_num}', octets)
+
+        snapshots[log_seq_num] = len(octets)
+        s3.put('snapshots.json', json.dumps(snapshots).encode())
+        log('uploaded new snapshot lsn(%d)', log_seq_num)
 
     # Start the backup thread
     args = (log_seq_num, logdir)
@@ -461,9 +469,12 @@ if __name__ == '__main__':
         db.close()
 
         with open(tmpdb, 'rb') as fd:
-            s3.put('index.latest', lz4.block.compress(fd.read()))
+            octets = lz4.block.compress(fd.read())
+            s3.put('snapshots/0', octets)
         os.remove(tmpdb)
+        s3.put('snapshots.json', json.dumps({0: len(octets)}).encode())
+        log('store initialized')
 
-        log('Store initialized')
         log(json.loads(s3.get('tail.json').decode()))
-        log(len(s3.get('index.latest')))
+        log(len(s3.get('snapshots/0')))
+        log(json.loads(s3.get('snapshots.json').decode()))
