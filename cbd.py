@@ -274,24 +274,22 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         if (3 == cmd and len(logs) > 0) or len(logs) > 4096:
             log_seq_num += 1
 
-            i = 0
             deletes = list()
             inserts = list()
             tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
             with open(tmpfile, 'wb') as fd:
                 for k in sorted(logs.keys()):
+                    offset = fd.tell()
+
                     fd.write(logs[k][0])  # header   - 32 bytes
                     fd.write(logs[k][1])  # block    - compressed block_size
                     fd.write(logs[k][2])  # checksum - 32 bytes
 
                     # delete the existing row and insert the new value
                     deletes.append([k])
-                    inserts.append([k, log_seq_num, i, len(logs[k][1])])
+                    inserts.append([k, log_seq_num, offset, len(logs[k][1])])
 
-                    # update the offset into the log file number log_seq_num
-                    i += 32 + len(logs[k][1]) + 32
-
-                fd.write(struct.pack('!Q', i+8))  # eof marker
+                fd.write(struct.pack('!Q', fd.tell()+8))  # eof marker
 
             # atomically rename the tmp file now, avoiding half written files
             os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
@@ -369,13 +367,14 @@ def main():
     for lsn in range(max_lsn+1, log_seq_num+1):
         download_lsnfile(s3, lsn)
 
-        i = j = 0
         deletes = list()
         inserts = list()
 
         # read each record and verify checksum
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
             while True:
+                offset = fd.tell()
+
                 hdr = fd.read(32)
 
                 if 8 == len(hdr):
@@ -394,10 +393,7 @@ def main():
                     panic('corrupt logfile(%d)', lsn)
 
                 deletes.append([blk])
-                inserts.append([blk, logseq, i, length])
-
-                i += 32 + length + 32  # move the offset to next record
-                j += 1                 # block counter
+                inserts.append([blk, logseq, offset, length])
 
         # all records are consisent, update the index
         db.executemany('delete from blocks where block=?', deletes)
@@ -405,7 +401,7 @@ def main():
                           values(?,?,?,?)
                        ''', inserts)
         db.commit()
-        log('updated map(%d) blocks(%d)', lsn, j)
+        log('updated map(%d) blocks(%d)', lsn, len(inserts))
 
     row = db.execute('''select count(distinct block), count(distinct lsn)
                         from blocks''').fetchone()
