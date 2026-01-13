@@ -453,9 +453,10 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
     ARGS.add_argument('--datadir', default='datadir', help='local write area')
-    ARGS.add_argument('--bucket',
-                      default='https://s3.us-east-005.backblazeb2.com/bucket',
-                      help='object store')
+    ARGS.add_argument(
+        '--bucket',
+        default='https://s3.us-east-005.backblazeb2.com/cloudblockdevice',
+        help='object store')
 
     ARGS = ARGS.parse_args()
 
