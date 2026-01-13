@@ -66,8 +66,8 @@ class S3:
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
         else:
-            os.makedirs(os.path.join(bucket, prefix, 'log'), exist_ok=True)
-            os.makedirs(os.path.join(bucket, prefix, 'snapshots'), exist_ok=True)
+            for d in ('log', 'snapshots'):
+                os.makedirs(os.path.join(bucket, prefix, d), exist_ok=True)
 
     def put(self, key, value):
         ts = time.time()
@@ -115,20 +115,24 @@ def backup(log_seq_num, logdir):
     s3 = S3(ARGS.bucket, ARGS.prefix)
 
     while True:
-        lsn = log_seq_num + 1
+        try:
+            lsn = log_seq_num + 1
 
-        lsnfile = os.path.join(logdir, str(lsn))
-        if not os.path.isfile(lsnfile):
-            time.sleep(1)
-            continue
+            lsnfile = os.path.join(logdir, str(lsn))
+            if not os.path.isfile(lsnfile):
+                time.sleep(1)
+                continue
 
-        with open(lsnfile, 'rb') as fd:
-            octets = fd.read()
+            with open(lsnfile, 'rb') as fd:
+                s3.put(f'log/{lsn}', fd.read())
 
-        s3.put(f'log/{lsn}', octets)
-        s3.put('tail.json', json.dumps(dict(lsn=lsn)).encode())
+            s3.put('tail.json', json.dumps(dict(lsn=lsn)).encode())
 
-        log_seq_num = lsn
+            log_seq_num = lsn
+
+        except Exception:
+            traceback.print_exc()
+            time.sleep(10)
 
 
 def recvall(conn, length):
@@ -287,6 +291,8 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
                     # update the offset into the log file number log_seq_num
                     i += 32 + len(logs[k][1]) + 32
 
+                fd.write(struct.pack('!Q', i+8))  # eof marker
+
             # atomically rename the tmp file now, avoiding half written files
             os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
 
@@ -371,8 +377,13 @@ def main():
         with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
             while True:
                 hdr = fd.read(32)
-                if not hdr:
-                    break
+
+                if 8 == len(hdr):
+                    # reached end of the file
+                    if fd.tell() != struct.unpack('!Q', hdr)[0]:
+                        panic('corrupt file')
+                    else:
+                        break  # this file is successfully processed
 
                 blk, logseq, usec, length = struct.unpack('!QQQQ', hdr)
 
