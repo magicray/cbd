@@ -271,7 +271,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             stats['write'] += block_count
 
         # FLUSH
-        if (3 == cmd and len(logs) > 0) or len(logs) > 4096:
+        if (3 == cmd and len(logs) > 0) or len(logs) > 1024:
             log_seq_num += 1
 
             deletes = list()
