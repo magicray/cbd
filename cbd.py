@@ -73,17 +73,22 @@ class S3:
         ts = time.time()
         key = os.path.join(self.prefix, key)
 
-        if self.endpoint:
-            self.s3.put_object(Bucket=self.bucket, Key=key, Body=value)
-        else:
-            tmpfile = os.path.join(self.bucket, uuid.uuid4().hex)
-            with open(tmpfile, 'wb') as fd:
-                fd.write(value)
-            os.rename(tmpfile, os.path.join(self.bucket, key))
+        if ARGS.lsn is None:
+            if self.endpoint:
+                self.s3.put_object(Bucket=self.bucket, Key=key, Body=value)
+            else:
+                tmpfile = os.path.join(self.bucket, uuid.uuid4().hex)
+                with open(tmpfile, 'wb') as fd:
+                    fd.write(value)
+                os.rename(tmpfile, os.path.join(self.bucket, key))
 
-        log('put(%s/%s/%s) length(%d) msec(%d)',
-            self.endpoint, self.bucket, key, len(value),
-            (time.time()-ts) * 1000)
+            log('put(%s/%s/%s) length(%d) msec(%d)',
+                self.endpoint, self.bucket, key, len(value),
+                (time.time()-ts) * 1000)
+        else:
+            log('skipped put(%s/%s/%s) length(%d) msec(%d)',
+                self.endpoint, self.bucket, key, len(value),
+                (time.time()-ts) * 1000)
 
     def get(self, key):
         ts = time.time()
@@ -340,7 +345,11 @@ def download_lsnfile(s3, lsn):
 def main():
     block_size, block_count = 4096, 2**31-1
     s3 = S3(ARGS.bucket, ARGS.prefix)
-    log_seq_num = json.loads(s3.get('tail.json').decode())['lsn']
+
+    if ARGS.lsn is None:
+        remote_lsn = json.loads(s3.get('tail.json').decode())['lsn']
+    else:
+        remote_lsn = ARGS.lsn
 
     logdir = os.path.join(ARGS.datadir, ARGS.prefix, 'log')
     index_db = os.path.join(ARGS.datadir, ARGS.prefix, 'index.sqlite3')
@@ -349,22 +358,24 @@ def main():
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
         snapshots = json.loads(s3.get('snapshots.json').decode())
-        latest = max([int(k) for k in snapshots.keys()])
+        log('snapshots : %s', sorted(map(int, snapshots)))
+        lsn = max([int(k) for k in snapshots.keys() if int(k) <= remote_lsn])
+
         tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
-            fd.write(lz4.block.decompress(s3.get(f'snapshots/{latest}')))
+            fd.write(lz4.block.decompress(s3.get(f'snapshots/{lsn}')))
         os.rename(tmpfile, index_db)
 
     db = sqlite3.connect(index_db)
 
-    max_lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
-    if max_lsn is None:
-        max_lsn = 0
+    local_lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
+    if local_lsn is None:
+        local_lsn = 0
 
-    log('log_seq_num(%d) max_lsn(%d)', log_seq_num, max_lsn)
+    log('remote_lsn(%d) local_lsn(%d)', remote_lsn, local_lsn)
 
     # update the index db with the latest log files
-    for lsn in range(max_lsn+1, log_seq_num+1):
+    for lsn in range(local_lsn+1, remote_lsn+1):
         download_lsnfile(s3, lsn)
 
         deletes = list()
@@ -406,21 +417,25 @@ def main():
     row = db.execute('''select count(distinct block), count(distinct lsn)
                         from blocks''').fetchone()
     log('total_blocks(%d) total_files(%d)', row[0], row[1])
+
+    local_lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
+    if local_lsn is None:
+        local_lsn = 0
     db.close()
 
     # upload the updated index db to the object store
     snapshots = json.loads(s3.get('snapshots.json').decode())
-    if str(log_seq_num) not in snapshots:
+    if str(local_lsn) not in snapshots and local_lsn <= remote_lsn:
         with open(index_db, 'rb') as fd:
             octets = lz4.block.compress(fd.read())
-        s3.put(f'snapshots/{log_seq_num}', octets)
+        s3.put(f'snapshots/{local_lsn}', octets)
 
-        snapshots[log_seq_num] = len(octets)
+        snapshots[local_lsn] = len(octets)
         s3.put('snapshots.json', json.dumps(snapshots).encode())
-        log('uploaded new snapshot lsn(%d)', log_seq_num)
+        log('uploaded new snapshot lsn(%d)', local_lsn)
 
     # Start the backup thread
-    args = (log_seq_num, logdir)
+    args = (remote_lsn, logdir)
     threading.Thread(target=backup, args=args).start()
 
     # Initialize the unix domain server socket
@@ -432,7 +447,7 @@ def main():
 
     # Start the server thread
     args = (server_sock, block_size, block_count,
-            logdir, log_seq_num, index_db)
+            logdir, remote_lsn, index_db)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
@@ -450,6 +465,8 @@ if __name__ == '__main__':
     ARGS = argparse.ArgumentParser()
 
     ARGS.add_argument('--device', help='device path')
+    ARGS.add_argument('--lsn', type=int,
+                      help='specific lsn to use for recovery')
 
     ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
     ARGS.add_argument('--datadir', default='datadir', help='local write area')
