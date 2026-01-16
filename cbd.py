@@ -16,13 +16,17 @@ import traceback
 from logging import critical as log
 
 
+BLOCK_SIZE = 4096
+BLOCK_COUNT = 2**31-1
+
+
 def panic(msg):
     log(msg)
     traceback.print_exc()
     os._exit(1)
 
 
-def device_init(dev, block_size, block_count, conn):
+def device_init(dev, conn):
     # Value = (0xab << 8) + n
     # Network Block Device ioctl commands
     NBD_SET_SOCK = 43776
@@ -41,8 +45,8 @@ def device_init(dev, block_size, block_count, conn):
     fcntl.ioctl(fd, NBD_CLEAR_QUEUE)
     fcntl.ioctl(fd, NBD_DISCONNECT)
     fcntl.ioctl(fd, NBD_CLEAR_SOCK)
-    fcntl.ioctl(fd, NBD_SET_BLKSIZE, block_size)
-    fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, block_count)
+    fcntl.ioctl(fd, NBD_SET_BLKSIZE, BLOCK_SIZE)
+    fcntl.ioctl(fd, NBD_SET_SIZE_BLOCKS, BLOCK_COUNT)
     fcntl.ioctl(fd, NBD_SET_TIMEOUT, 60)
     fcntl.ioctl(fd, NBD_PRINT_DEBUG)
     fcntl.ioctl(fd, NBD_SET_SOCK, conn)
@@ -50,8 +54,7 @@ def device_init(dev, block_size, block_count, conn):
     # set options : FLUSH(4)
     fcntl.ioctl(fd, NBD_SET_FLAGS, 4+1)
 
-    log('initialized(%s) block_size(%d) block_count(%d)',
-        dev, block_size, block_count)
+    log('initialized(%s)', dev)
 
     # Block forever
     fcntl.ioctl(fd, NBD_DO_IT)
@@ -66,7 +69,7 @@ class S3:
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
         else:
-            for d in ('log', 'snapshots'):
+            for d in ('log', 'index'):
                 os.makedirs(os.path.join(bucket, prefix, d), exist_ok=True)
 
     def put(self, key, value):
@@ -116,24 +119,21 @@ class S3:
         return octets if octets else None
 
 
-def backup(log_seq_num, logdir):
+def backup(remote_lsn, logdir):
     s3 = S3(ARGS.bucket, ARGS.prefix)
 
     while True:
         try:
-            lsn = log_seq_num + 1
+            lsnfile = os.path.join(logdir, str(remote_lsn+1))
+            if os.path.isfile(lsnfile):
+                with open(lsnfile, 'rb') as fd:
+                    s3.put(f'log/{remote_lsn+1}', fd.read())
 
-            lsnfile = os.path.join(logdir, str(lsn))
-            if not os.path.isfile(lsnfile):
+                s3.put('log.json', json.dumps(dict(lsn=remote_lsn+1)).encode())
+
+                remote_lsn += 1
+            else:
                 time.sleep(1)
-                continue
-
-            with open(lsnfile, 'rb') as fd:
-                s3.put(f'log/{lsn}', fd.read())
-
-            s3.put('tail.json', json.dumps(dict(lsn=lsn)).encode())
-
-            log_seq_num = lsn
 
         except Exception:
             traceback.print_exc()
@@ -162,14 +162,14 @@ def recvall(conn, length):
     return octets
 
 
-def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
+def server(sock, logdir, remote_lsn, db):
     db = sqlite3.connect(db)
     s3 = S3(ARGS.bucket, ARGS.prefix)
 
     conn, peer = sock.accept()
     log('client connection accepted')
 
-    zeroed_block = lz4.block.compress(bytearray(block_size))
+    zeroed_block = lz4.block.compress(bytearray(BLOCK_SIZE))
 
     fds = dict()
     logs = dict()
@@ -185,14 +185,14 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         if 0x25609513 != magic:
             panic(f'invalid magic({magic}) or cmd({cmd})')
 
-        if 0 != req_offset % block_size or 0 != req_length % block_size:
+        if 0 != req_offset % BLOCK_SIZE or 0 != req_length % BLOCK_SIZE:
             panic(f'invalid offset({req_offset}) or length({req_length})')
 
         # Response header is common. No errors are supported.
         response_header = struct.pack('!IIQ', 0x67446698, 0, cookie)
 
-        block_count = req_length // block_size
-        block_offset = req_offset // block_size
+        block_count = req_length // BLOCK_SIZE
+        block_offset = req_offset // BLOCK_SIZE
 
         # READ
         if 0 == cmd:
@@ -261,10 +261,10 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
         if 1 == cmd:
             for i in range(block_offset, block_offset+block_count):
                 # read the block from the socket and compress it
-                octets = lz4.block.compress(recvall(conn, block_size))
+                octets = lz4.block.compress(recvall(conn, BLOCK_SIZE))
 
                 # header : block_index, lsn, usec_timestamp, length
-                hdr = struct.pack('!QQQQ', i, log_seq_num+1,
+                hdr = struct.pack('!QQQQ', i, remote_lsn+1,
                                   int(ts*1000000), len(octets))
 
                 sha = hashlib.sha256(hdr)
@@ -277,7 +277,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
         # FLUSH
         if (3 == cmd and len(logs) > 0) or len(logs) > 1024:
-            log_seq_num += 1
+            remote_lsn += 1
 
             deletes = list()
             inserts = list()
@@ -292,12 +292,12 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
 
                     # delete the existing row and insert the new value
                     deletes.append([k])
-                    inserts.append([k, log_seq_num, offset, len(logs[k][1])])
+                    inserts.append([k, remote_lsn, offset, len(logs[k][1])])
 
                 fd.write(struct.pack('!Q', fd.tell()+8))  # eof marker
 
             # atomically rename the tmp file now, avoiding half written files
-            os.rename(tmpfile, os.path.join(logdir, str(log_seq_num)))
+            os.rename(tmpfile, os.path.join(logdir, str(remote_lsn)))
 
             # update the index database
             db.executemany('delete from blocks where block=?', deletes)
@@ -308,7 +308,7 @@ def server(sock, block_size, device_block_count, logdir, log_seq_num, db):
             db.commit()
 
             log('lsn(%d) read(%d) write(%d) msec(%d)',
-                log_seq_num, stats['read'], stats['write'],
+                remote_lsn, stats['read'], stats['write'],
                 (time.time()-stats['ts'])*1000)
 
             logs = dict()
@@ -333,7 +333,7 @@ def download_lsnfile(s3, lsn):
     if not os.path.isfile(lsnfile):
         octets = s3.get(f'log/{lsn}')
         if not octets:
-            panic(f'invalid lsn({lsn})')
+            panic(f'empty log file({lsn})')
 
         # write data to a tmp file and then atomically rename
         tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
@@ -342,12 +342,11 @@ def download_lsnfile(s3, lsn):
         os.rename(tmpfile, lsnfile)
 
 
-def main():
-    block_size, block_count = 4096, 2**31-1
+def start():
     s3 = S3(ARGS.bucket, ARGS.prefix)
 
     if ARGS.lsn is None:
-        remote_lsn = json.loads(s3.get('tail.json').decode())['lsn']
+        remote_lsn = json.loads(s3.get('log.json').decode())['lsn']
     else:
         remote_lsn = ARGS.lsn
 
@@ -357,13 +356,13 @@ def main():
 
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
-        snapshots = json.loads(s3.get('snapshots.json').decode())
-        log('snapshots : %s', sorted(map(int, snapshots)))
-        lsn = max([int(k) for k in snapshots.keys() if int(k) <= remote_lsn])
+        index = json.loads(s3.get('index.json').decode())
+        log('index : %s', sorted(map(int, index)))
+        lsn = max([int(k) for k in index.keys() if int(k) <= remote_lsn])
 
         tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
-            fd.write(lz4.block.decompress(s3.get(f'snapshots/{lsn}')))
+            fd.write(lz4.block.decompress(s3.get(f'index/{lsn}')))
         os.rename(tmpfile, index_db)
 
     db = sqlite3.connect(index_db)
@@ -424,16 +423,20 @@ def main():
     db.close()
 
     # upload the updated index db to the object store
-    snapshots = json.loads(s3.get('snapshots.json').decode())
-    if str(local_lsn) not in snapshots and local_lsn <= remote_lsn:
+    index = json.loads(s3.get('index.json').decode())
+    if str(local_lsn) not in index and local_lsn <= remote_lsn:
         with open(index_db, 'rb') as fd:
             octets = lz4.block.compress(fd.read())
-        s3.put(f'snapshots/{local_lsn}', octets)
+        s3.put(f'index/{local_lsn}', octets)
 
-        snapshots[local_lsn] = len(octets)
-        s3.put('snapshots.json', json.dumps(snapshots).encode())
-        log('uploaded new snapshot lsn(%d)', local_lsn)
+        index[local_lsn] = len(octets)
+        s3.put('index.json', json.dumps(index).encode())
+        log('uploaded new index lsn(%d)', local_lsn)
 
+    return remote_lsn, logdir, index_db
+
+
+def run(remote_lsn, logdir, index_db):
     # Start the backup thread
     args = (remote_lsn, logdir)
     threading.Thread(target=backup, args=args).start()
@@ -446,8 +449,7 @@ def main():
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, block_size, block_count,
-            logdir, remote_lsn, index_db)
+    args = (server_sock, logdir, remote_lsn, index_db)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
@@ -456,13 +458,18 @@ def main():
     os.remove(sock_path)
 
     # Initialize the device, attach the client socket created above
-    device_init(ARGS.device, block_size, block_count, client_sock.fileno())
+    device_init(ARGS.device, client_sock.fileno())
 
 
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
     ARGS = argparse.ArgumentParser()
+
+    ARGS.add_argument('--format_bucket', action='store_true',
+                      help='initialize the object store')
+    ARGS.add_argument('--update', action='store_true',
+                      help='update the latest index')
 
     ARGS.add_argument('--device', help='device path')
     ARGS.add_argument('--lsn', type=int,
@@ -477,11 +484,15 @@ if __name__ == '__main__':
 
     ARGS = ARGS.parse_args()
 
-    if ARGS.device:
-        main()
-    else:
+    if ARGS.update:
+        start()
+
+    elif ARGS.device:
+        run(*start())
+
+    elif ARGS.format_bucket:
         s3 = S3(ARGS.bucket, ARGS.prefix)
-        s3.put('tail.json', json.dumps(dict(lsn=0)).encode())
+        s3.put('log.json', json.dumps(dict(lsn=0)).encode())
 
         tmpdb = os.path.join('/tmp', uuid.uuid4().hex)
         db = sqlite3.connect(tmpdb)
@@ -495,11 +506,11 @@ if __name__ == '__main__':
 
         with open(tmpdb, 'rb') as fd:
             octets = lz4.block.compress(fd.read())
-            s3.put('snapshots/0', octets)
+            s3.put('index/0', octets)
         os.remove(tmpdb)
-        s3.put('snapshots.json', json.dumps({0: len(octets)}).encode())
+        s3.put('index.json', json.dumps({0: len(octets)}).encode())
         log('store initialized')
 
-        log(json.loads(s3.get('tail.json').decode()))
-        log(len(s3.get('snapshots/0')))
-        log(json.loads(s3.get('snapshots.json').decode()))
+        log(json.loads(s3.get('log.json').decode()))
+        log(len(s3.get('index/0')))
+        log(json.loads(s3.get('index.json').decode()))
