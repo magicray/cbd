@@ -483,12 +483,15 @@ if __name__ == '__main__':
 
     ARGS = argparse.ArgumentParser()
 
-    ARGS.add_argument('--format-bucket', action='store_true', dest='format',
+    ARGS.add_argument('--bucket',
+                      help='object store for backup')
+    ARGS.add_argument('--format', action='store_true',
                       help='initialize the object store')
     ARGS.add_argument('--update', action='store_true',
                       help='update the latest index')
 
-    ARGS.add_argument('--device', help='device path')
+    ARGS.add_argument('--device',
+                      help='device path')
     ARGS.add_argument('--lsn', type=int,
                       help='specific lsn to use for recovery')
 
@@ -499,10 +502,7 @@ if __name__ == '__main__':
     ARGS.add_argument('--cachedir', default='data/cachedir',
                       help='directory for caching data for reads')
 
-    ARGS.add_argument('--bucket', help='object store for backup')
-
     ARGS = ARGS.parse_args()
-
     ARGS.bucket = urllib.parse.urlparse(ARGS.bucket)
 
     if ARGS.update:
@@ -515,7 +515,7 @@ if __name__ == '__main__':
         s3 = S3(ARGS.bucket)
         s3.put('log.json', json.dumps(dict(lsn=0)).encode())
 
-        tmpdb = os.path.join('/tmp', uuid.uuid4().hex)
+        tmpdb = uuid.uuid4().hex
         db = sqlite3.connect(tmpdb)
         db.execute('''create table if not exists blocks(
                           block  unsigned int primary key,
@@ -530,7 +530,7 @@ if __name__ == '__main__':
             s3.put('index/0', octets)
         os.remove(tmpdb)
         s3.put('index.json', json.dumps({0: len(octets)}).encode())
-        log('store initialized')
+        log('object store initialized')
 
         log(json.loads(s3.get('log.json').decode()))
         log(len(s3.get('index/0')))
