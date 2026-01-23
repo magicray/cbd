@@ -13,6 +13,7 @@ import argparse
 import lz4.block
 import threading
 import traceback
+import urllib.parse
 from logging import critical as log
 
 
@@ -61,16 +62,17 @@ def device_init(dev, conn):
 
 
 class S3:
-    def __init__(self, bucket, prefix):
-        self.prefix = prefix
-        self.bucket = bucket.split('/')[-1]
-        self.endpoint = '/'.join(bucket.split('/')[:-1])
+    def __init__(self, bucket):
+        self.bucket = bucket.path.strip('/').split('/')[0]
+        self.prefix = os.path.join(*bucket.path.strip('/').split('/')[1:])
+        self.endpoint = f'{bucket.scheme}://{bucket.netloc}'.strip('/')
 
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
         else:
             for d in ('log', 'index'):
-                os.makedirs(os.path.join(bucket, prefix, d), exist_ok=True)
+                os.makedirs(os.path.join(self.bucket, self.prefix, d),
+                            exist_ok=True)
 
     def put(self, key, value):
         ts = time.time()
@@ -119,15 +121,19 @@ class S3:
         return octets if octets else None
 
 
-def backup(remote_lsn, logdir):
-    s3 = S3(ARGS.bucket, ARGS.prefix)
+def backup(remote_lsn):
+    s3 = S3(ARGS.bucket)
 
     while True:
         try:
-            lsnfile = os.path.join(logdir, str(remote_lsn+1))
+            lsnfile = os.path.join(ARGS.waldir, str(remote_lsn+1))
+            cachefile = os.path.join(ARGS.cachedir, str(remote_lsn+1))
+
             if os.path.isfile(lsnfile):
                 with open(lsnfile, 'rb') as fd:
                     s3.put(f'log/{remote_lsn+1}', fd.read())
+
+                os.rename(lsnfile, cachefile)
 
                 s3.put('log.json', json.dumps(dict(lsn=remote_lsn+1)).encode())
 
@@ -162,9 +168,9 @@ def recvall(conn, length):
     return octets
 
 
-def server(sock, logdir, remote_lsn, db):
+def server(sock, remote_lsn, db):
     db = sqlite3.connect(db)
-    s3 = S3(ARGS.bucket, ARGS.prefix)
+    s3 = S3(ARGS.bucket)
 
     conn, peer = sock.accept()
     log('client connection accepted')
@@ -216,12 +222,21 @@ def server(sock, logdir, remote_lsn, db):
                 elif i in rows:
                     lsn, index, length = rows[i]
 
-                    # if already present, this function would do nothing
-                    download_lsnfile(s3, lsn)
+                    if len(fds) > 1000:
+                        for fd in fds:
+                            os.close(fds[fd])
+                        fds = dict()
 
-                    lsn_file = os.path.join(logdir, str(lsn))
+                    lsn_file = os.path.join(ARGS.cachedir, str(lsn))
                     if lsn_file not in fds:
-                        fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
+                        try:
+                            tmpname = os.path.join(ARGS.waldir, str(lsn))
+                            fds[lsn_file] = os.open(tmpname, os.O_RDONLY)
+                        except:
+                            # if already present, this function would do nothing
+                            download_lsnfile(s3, lsn)
+
+                            fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
 
                     octets = os.pread(fds[lsn_file], 32+length+32, index)
 
@@ -281,7 +296,7 @@ def server(sock, logdir, remote_lsn, db):
 
             deletes = list()
             inserts = list()
-            tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
+            tmpfile = os.path.join(ARGS.waldir, uuid.uuid4().hex)
             with open(tmpfile, 'wb') as fd:
                 for k in sorted(logs.keys()):
                     offset = fd.tell()
@@ -297,7 +312,7 @@ def server(sock, logdir, remote_lsn, db):
                 fd.write(struct.pack('!Q', fd.tell()+8))  # eof marker
 
             # atomically rename the tmp file now, avoiding half written files
-            os.rename(tmpfile, os.path.join(logdir, str(remote_lsn)))
+            os.rename(tmpfile, os.path.join(ARGS.waldir, str(remote_lsn)))
 
             # update the index database
             db.executemany('delete from blocks where block=?', deletes)
@@ -327,7 +342,7 @@ def server(sock, logdir, remote_lsn, db):
 
 
 def download_lsnfile(s3, lsn):
-    lsnfile = os.path.join(ARGS.datadir, ARGS.prefix, 'log', str(lsn))
+    lsnfile = os.path.join(ARGS.cachedir, str(lsn))
 
     # download only if the file is not already downloaded
     if not os.path.isfile(lsnfile):
@@ -336,23 +351,25 @@ def download_lsnfile(s3, lsn):
             panic(f'empty log file({lsn})')
 
         # write data to a tmp file and then atomically rename
-        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
+        tmpfile = os.path.join(lsnfile + '.' + uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             fd.write(octets)
         os.rename(tmpfile, lsnfile)
 
 
 def start():
-    s3 = S3(ARGS.bucket, ARGS.prefix)
+    s3 = S3(ARGS.bucket)
 
     if ARGS.lsn is None:
         remote_lsn = json.loads(s3.get('log.json').decode())['lsn']
     else:
         remote_lsn = ARGS.lsn
 
-    logdir = os.path.join(ARGS.datadir, ARGS.prefix, 'log')
-    index_db = os.path.join(ARGS.datadir, ARGS.prefix, 'index.sqlite3')
-    os.makedirs(logdir, exist_ok=True)
+    os.makedirs(ARGS.waldir, exist_ok=True)
+    os.makedirs(ARGS.cachedir, exist_ok=True)
+    os.makedirs(ARGS.indexdir, exist_ok=True)
+
+    index_db = os.path.join(ARGS.indexdir, 'index.sqlite3')
 
     # download the index db if it is not already present
     if not os.path.isfile(index_db):
@@ -360,7 +377,7 @@ def start():
         log('index : %s', sorted(map(int, index)))
         lsn = max([int(k) for k in index.keys() if int(k) <= remote_lsn])
 
-        tmpfile = os.path.join(ARGS.datadir, ARGS.prefix, uuid.uuid4().hex)
+        tmpfile = os.path.join(ARGS.indexdir, uuid.uuid4().hex)
         with open(tmpfile, 'wb') as fd:
             fd.write(lz4.block.decompress(s3.get(f'index/{lsn}')))
         os.rename(tmpfile, index_db)
@@ -381,7 +398,7 @@ def start():
         inserts = list()
 
         # read each record and verify checksum
-        with open(os.path.join(logdir, str(lsn)), 'rb') as fd:
+        with open(os.path.join(ARGS.waldir, str(lsn)), 'rb') as fd:
             while True:
                 offset = fd.tell()
 
@@ -433,12 +450,12 @@ def start():
         s3.put('index.json', json.dumps(index).encode())
         log('uploaded new index lsn(%d)', local_lsn)
 
-    return remote_lsn, logdir, index_db
+    return remote_lsn, index_db
 
 
-def run(remote_lsn, logdir, index_db):
+def run(remote_lsn, index_db):
     # Start the backup thread
-    args = (remote_lsn, logdir)
+    args = (remote_lsn,)
     threading.Thread(target=backup, args=args).start()
 
     # Initialize the unix domain server socket
@@ -449,7 +466,7 @@ def run(remote_lsn, logdir, index_db):
     log('server listening on sock(%s)', sock_path)
 
     # Start the server thread
-    args = (server_sock, logdir, remote_lsn, index_db)
+    args = (server_sock, remote_lsn, index_db)
     threading.Thread(target=server, args=args).start()
 
     # Initialize the client socket, to be attached to the nbd device
@@ -466,7 +483,7 @@ if __name__ == '__main__':
 
     ARGS = argparse.ArgumentParser()
 
-    ARGS.add_argument('--format_bucket', action='store_true',
+    ARGS.add_argument('--format-bucket', action='store_true', dest='format',
                       help='initialize the object store')
     ARGS.add_argument('--update', action='store_true',
                       help='update the latest index')
@@ -475,14 +492,18 @@ if __name__ == '__main__':
     ARGS.add_argument('--lsn', type=int,
                       help='specific lsn to use for recovery')
 
-    ARGS.add_argument('--prefix', default='prefix', help='file path prefix')
-    ARGS.add_argument('--datadir', default='datadir', help='local write area')
-    ARGS.add_argument(
-        '--bucket',
-        default='https://s3.us-east-005.backblazeb2.com/cloudblockdevice',
-        help='object store')
+    ARGS.add_argument('--waldir', default='data/waldir',
+                      help='directory for write ahead log')
+    ARGS.add_argument('--indexdir', default='data/indexdir',
+                      help='directory for caching index')
+    ARGS.add_argument('--cachedir', default='data/cachedir',
+                      help='directory for caching data for reads')
+
+    ARGS.add_argument('--bucket', help='object store for backup')
 
     ARGS = ARGS.parse_args()
+
+    ARGS.bucket = urllib.parse.urlparse(ARGS.bucket)
 
     if ARGS.update:
         start()
@@ -490,8 +511,8 @@ if __name__ == '__main__':
     elif ARGS.device:
         run(*start())
 
-    elif ARGS.format_bucket:
-        s3 = S3(ARGS.bucket, ARGS.prefix)
+    elif ARGS.format:
+        s3 = S3(ARGS.bucket)
         s3.put('log.json', json.dumps(dict(lsn=0)).encode())
 
         tmpdb = os.path.join('/tmp', uuid.uuid4().hex)
