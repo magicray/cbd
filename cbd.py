@@ -398,7 +398,7 @@ def start():
         inserts = list()
 
         # read each record and verify checksum
-        with open(os.path.join(ARGS.waldir, str(lsn)), 'rb') as fd:
+        with open(os.path.join(ARGS.cachedir, str(lsn)), 'rb') as fd:
             while True:
                 offset = fd.tell()
 
