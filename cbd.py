@@ -65,7 +65,7 @@ class S3:
     def __init__(self, bucket):
         self.bucket = bucket.path.strip('/').split('/')[0]
         self.prefix = os.path.join(*bucket.path.strip('/').split('/')[1:])
-        self.endpoint = f'{bucket.scheme}://{bucket.netloc}'.strip('/')
+        self.endpoint = f'{bucket.scheme}://{bucket.netloc}'.strip('/').strip(':')
 
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
@@ -93,6 +93,24 @@ class S3:
         else:
             log('skipped put(%s/%s/%s) length(%d) msec(%d)',
                 self.endpoint, self.bucket, key, len(value),
+                (time.time()-ts) * 1000)
+
+    def delete(self, key):
+        ts = time.time()
+        key = os.path.join(self.prefix, key)
+
+        if ARGS.lsn is None:
+            if self.endpoint:
+                self.s3.delete_object(Bucket=self.bucket, Key=key)
+            else:
+                os.remove(os.path.join(self.bucket, key))
+
+            log('delete(%s/%s/%s) msec(%d)',
+                self.endpoint, self.bucket, key,
+                (time.time()-ts) * 1000)
+        else:
+            log('skipped delete(%s/%s/%s) msec(%d)',
+                self.endpoint, self.bucket, key,
                 (time.time()-ts) * 1000)
 
     def get(self, key):
@@ -365,7 +383,6 @@ def start():
     else:
         remote_lsn = ARGS.lsn
 
-    os.makedirs(ARGS.waldir, exist_ok=True)
     os.makedirs(ARGS.cachedir, exist_ok=True)
     os.makedirs(ARGS.indexdir, exist_ok=True)
 
@@ -450,10 +467,14 @@ def start():
         s3.put('index.json', json.dumps(index).encode())
         log('uploaded new index lsn(%d)', local_lsn)
 
+    log(f'remote_lsn({remote_lsn}) index_db({index_db})')
+
     return remote_lsn, index_db
 
 
 def run(remote_lsn, index_db):
+    os.makedirs(ARGS.waldir, exist_ok=True)
+
     # Start the backup thread
     args = (remote_lsn,)
     threading.Thread(target=backup, args=args).start()
@@ -478,6 +499,45 @@ def run(remote_lsn, index_db):
     device_init(ARGS.device, client_sock.fileno())
 
 
+def purge(lsn):
+    s3 = S3(ARGS.bucket)
+    indexes = json.loads(s3.get('index.json').decode())
+    keys = list(map(int, indexes.keys()))
+    if lsn not in keys:
+        os._exit(1)
+
+    min_index = min(keys)
+
+    max_lsn = list()
+    file_set = list()
+    for i in (min_index, lsn):
+        tmpfile = uuid.uuid4().hex
+        with open(tmpfile, 'wb') as fd:
+            fd.write(lz4.block.decompress(s3.get(f'index/{i}')))
+
+        db = sqlite3.connect(tmpfile)
+        rows = db.execute('select distinct(lsn) from blocks').fetchall()
+        file_set.append(set([r[0] for r in rows]))
+        lsn = db.execute('select max(lsn) from blocks').fetchone()[0]
+        max_lsn.append(lsn if lsn else 0)
+
+        os.remove(tmpfile)
+
+    file_set[0].update(range(max_lsn[0]+1, max_lsn[1]+1))
+
+    diff = file_set[0] - file_set[1]
+
+    for i in sorted(diff):
+        s3.delete(f'log/{i}')
+
+    for i in sorted(keys):
+        if i < lsn:
+            s3.delete(f'index/{i}')
+            indexes.pop(str(i))
+
+    s3.put('index.json', json.dumps(indexes).encode())
+
+
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
@@ -485,10 +545,14 @@ if __name__ == '__main__':
 
     ARGS.add_argument('--bucket',
                       help='object store for backup')
-    ARGS.add_argument('--format', action='store_true',
+    ARGS.add_argument('--reset', action='store_true',
                       help='initialize the object store')
     ARGS.add_argument('--update', action='store_true',
                       help='update the latest index')
+    ARGS.add_argument('--list', action='store_true',
+                      help='list log tail and index files')
+    ARGS.add_argument('--purge', type=int,
+                      help='list log tail and index files')
 
     ARGS.add_argument('--device',
                       help='device path')
@@ -505,13 +569,24 @@ if __name__ == '__main__':
     ARGS = ARGS.parse_args()
     ARGS.bucket = urllib.parse.urlparse(ARGS.bucket)
 
-    if ARGS.update:
+    if ARGS.list:
+        s3 = S3(ARGS.bucket)
+        lsn = json.loads(s3.get('log.json').decode())['lsn']
+        indexes = json.loads(s3.get('index.json').decode())
+        print(f'lsn : {lsn}')
+        for k in sorted([int(k) for k in indexes]):
+            print(f'index {k} : {indexes[str(k)]}')
+
+    elif ARGS.update:
         start()
 
     elif ARGS.device:
         run(*start())
 
-    elif ARGS.format:
+    elif ARGS.purge:
+        purge(ARGS.purge)
+
+    elif ARGS.reset:
         s3 = S3(ARGS.bucket)
         s3.put('log.json', json.dumps(dict(lsn=0)).encode())
 
