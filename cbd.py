@@ -65,7 +65,9 @@ class S3:
     def __init__(self, bucket):
         self.bucket = bucket.path.strip('/').split('/')[0]
         self.prefix = os.path.join(*bucket.path.strip('/').split('/')[1:])
-        self.endpoint = f'{bucket.scheme}://{bucket.netloc}'.strip('/').strip(':')
+
+        self.endpoint = f'{bucket.scheme}://{bucket.netloc}'
+        self.endpoint = self.endpoint.strip('/').strip(':')
 
         if self.endpoint:
             self.s3 = boto3.client('s3', endpoint_url=self.endpoint)
@@ -250,8 +252,8 @@ def server(sock, remote_lsn, db):
                         try:
                             tmpname = os.path.join(ARGS.waldir, str(lsn))
                             fds[lsn_file] = os.open(tmpname, os.O_RDONLY)
-                        except:
-                            # if already present, this function would do nothing
+                        except Exception:
+                            # if already present, it would skip download
                             download_lsnfile(s3, lsn)
 
                             fds[lsn_file] = os.open(lsn_file, os.O_RDONLY)
@@ -511,9 +513,11 @@ def purge(lsn):
     max_lsn = list()
     file_set = list()
     for i in (min_index, lsn):
+        octets = lz4.block.decompress(s3.get(f'index/{i}'))
+
         tmpfile = uuid.uuid4().hex
         with open(tmpfile, 'wb') as fd:
-            fd.write(lz4.block.decompress(s3.get(f'index/{i}')))
+            fd.write(octets)
 
         db = sqlite3.connect(tmpfile)
         rows = db.execute('select distinct(lsn) from blocks').fetchall()
