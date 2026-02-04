@@ -542,6 +542,41 @@ def purge(lsn):
     s3.put('index.json', json.dumps(indexes).encode())
 
 
+def reset(bucket):
+    s3 = S3(bucket)
+    s3.put('log.json', json.dumps(dict(lsn=0)).encode())
+
+    tmpdb = uuid.uuid4().hex
+    db = sqlite3.connect(tmpdb)
+    db.execute('''create table if not exists blocks(
+                      block  unsigned int primary key,
+                      lsn    unsigned int,
+                      offset unsigned int,
+                      length unsigned int)
+               ''')
+    db.close()
+
+    with open(tmpdb, 'rb') as fd:
+        octets = lz4.block.compress(fd.read())
+        s3.put('index/0', octets)
+    os.remove(tmpdb)
+    s3.put('index.json', json.dumps({0: len(octets)}).encode())
+    print('object store initialized')
+
+    print(json.loads(s3.get('log.json').decode()))
+    print(len(s3.get('index/0')))
+    print(json.loads(s3.get('index.json').decode()))
+
+
+def list_info(bucket):
+    s3 = S3(bucket)
+    lsn = json.loads(s3.get('log.json').decode())['lsn']
+    indexes = json.loads(s3.get('index.json').decode())
+    print(f'lsn : {lsn}')
+    for k in sorted([int(k) for k in indexes]):
+        print(f'index {k} : {indexes[str(k)]}')
+
+
 if __name__ == '__main__':
     logging.basicConfig(format='%(asctime)s %(process)d : %(message)s')
 
@@ -574,12 +609,7 @@ if __name__ == '__main__':
     ARGS.bucket = urllib.parse.urlparse(ARGS.bucket)
 
     if ARGS.list:
-        s3 = S3(ARGS.bucket)
-        lsn = json.loads(s3.get('log.json').decode())['lsn']
-        indexes = json.loads(s3.get('index.json').decode())
-        print(f'lsn : {lsn}')
-        for k in sorted([int(k) for k in indexes]):
-            print(f'index {k} : {indexes[str(k)]}')
+        list_info(ARGS.bucket)
 
     elif ARGS.update:
         start()
@@ -591,26 +621,4 @@ if __name__ == '__main__':
         purge(ARGS.purge)
 
     elif ARGS.reset:
-        s3 = S3(ARGS.bucket)
-        s3.put('log.json', json.dumps(dict(lsn=0)).encode())
-
-        tmpdb = uuid.uuid4().hex
-        db = sqlite3.connect(tmpdb)
-        db.execute('''create table if not exists blocks(
-                          block  unsigned int primary key,
-                          lsn    unsigned int,
-                          offset unsigned int,
-                          length unsigned int)
-                   ''')
-        db.close()
-
-        with open(tmpdb, 'rb') as fd:
-            octets = lz4.block.compress(fd.read())
-            s3.put('index/0', octets)
-        os.remove(tmpdb)
-        s3.put('index.json', json.dumps({0: len(octets)}).encode())
-        log('object store initialized')
-
-        log(json.loads(s3.get('log.json').decode()))
-        log(len(s3.get('index/0')))
-        log(json.loads(s3.get('index.json').decode()))
+        reset(ARGS.bucket)
